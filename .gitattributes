@@ -1,0 +1,8 @@
+# Keep every text file with LF line endings in the repo and in your working copy,
+# whatever the OS (Git for Windows defaults to converting LF -> CRLF on checkout).
+* text=auto eol=lf
+
+# binary files: never touch
+*.png binary
+*.jpg binary
+*.pdf binary
