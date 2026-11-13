@@ -1,0 +1,29 @@
+# PostSync hook: runs AFTER every resource in frontend/ is applied AND Healthy.
+# Smoke test: calls the frontend, which itself calls the backend, so one request
+# checks the whole chain. A failure marks the sync as Failed.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: frontend-smoke-test
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 120
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: smoke
+          image: curlimages/curl:8.10.1
+          command:
+            - sh
+            - -c
+            - |
+              echo "Running frontend smoke test..."
+              # -f: fail on HTTP >= 400   -sS: quiet but show errors
+              # --retry: Service endpoints can lag a second behind "Healthy"
+              curl -fsS --retry 5 --retry-delay 2 --retry-all-errors http://frontend-svc:80/
+              echo
+              echo "Smoke test passed."

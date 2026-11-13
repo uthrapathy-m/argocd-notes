@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app1
+  labels:
+    app: app1
+  # no namespace on purpose: Argo CD injects spec.destination.namespace (app1-ns)
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app1
+  template:
+    metadata:
+      labels:
+        app: app1
+    spec:
+      imagePullSecrets:
+        - name: dockerhub-secret # created by hand in app1-ns (lab step 4.5)
+      containers:
+        - name: app1
+          image: <DOCKERHUB_USER>/app1:v1.0.0
+          ports:
+            - containerPort: 5000

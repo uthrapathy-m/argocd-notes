@@ -1,0 +1,29 @@
+# PreSync hook: runs BEFORE Argo CD applies anything in backend/.
+# If it fails, the sync stops and the Deployment/Service are NOT touched.
+# Stands in for a database migration (Flyway/Liquibase/Alembic in real life).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: presync-db-migration
+  # no namespace: the Application's destination (app1-ns) fills it in
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    # BeforeHookCreation: delete the previous run (e.g. a failed one) before creating this one
+    # HookSucceeded: delete the Job once it succeeds; a FAILED Job stays so you can read its logs
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+spec:
+  backoffLimit: 0             # fail fast: the Job default is 6 pod retries with backoff
+  activeDeadlineSeconds: 120  # a hung migration must not block the sync forever
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: busybox:1.36   # pinned: never run an unpinned image in a gate
+          command:
+            - sh
+            - -c
+            - |
+              echo "Running DB migrations..."
+              sleep 15
+              echo "Migration completed successfully."

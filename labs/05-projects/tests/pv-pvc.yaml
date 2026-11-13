@@ -1,0 +1,29 @@
+# Test 1: kinds the project does NOT allow.
+# Copy into app1-backend-config/backend/ and push. Expect: sync fails with
+# "PersistentVolume ... is not permitted in project app1-project" (cluster-scoped, not whitelisted)
+# "PersistentVolumeClaim ... is not permitted in project app1-project" (namespaced, not whitelisted)
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: app1-backend-pv
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: app1-manual
+  hostPath:
+    path: /mnt/app1-backend-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app1-backend-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: app1-manual
+  resources:
+    requests:
+      storage: 1Gi

@@ -1,0 +1,524 @@
+# 03 · CRDs and the Argo CD Application CRD (first deployment)
+
+> **Lab needs:** local k3d with Argo CD installed ([00-lab-setup.md](00-lab-setup.md)).
+>
+> **Lab files:** [`labs/03-application-crd/`](../labs/03-application-crd)
+>
+> **Time:** ~40 min reading + ~75 min lab + 20 min revision
+
+---
+
+## TL;DR
+
+1. **Resource Definition** = the schema (built-in, e.g. `Deployment`). **Resource** = your instance of it. Custom versions of each: **CRD** and **Custom Resource**.
+2. A **CRD only defines schema.** Kubernetes stores and validates CRs but doesn't *act* on them. A **controller** adds behaviour. CRD + controller = the **Operator pattern**. Argo CD is an operator.
+3. Controllers exist only where state can **drift** (Deployment, StatefulSet, Job, CronJob). Static objects (ConfigMap, Secret) don't need one. *"Controllers watch what matters, not everything."*
+4. An **`Application`** (`argoproj.io/v1alpha1`) is **Argo CD's object, not your app**. It's the **contract** that connects a **source** (repo + revision + path) to a **destination** (cluster + namespace).
+5. Create `Application`s in the **Argo CD namespace** (`argocd`). Your workloads go in the *destination* namespace.
+6. `targetRevision: HEAD` = the latest commit on the repo's **default branch**. It can also be a branch, a tag or a commit SHA.
+7. Argo CD **injects the destination namespace** into manifests that don't set one, and adds a **tracking annotation**. Keep manifests namespace-free so they're reusable.
+8. Argo CD **doesn't create the namespace by default**, so the first sync fails. Either create it, or use `syncOptions: [CreateNamespace=true]`.
+9. **Sync status** ("does the cluster match Git?") ≠ **Health status** ("is it working?"). An app can be *Synced + Degraded*.
+10. **One `Application` = one independently deployable unit** (a microservice, a tier, or a monolith).
+
+---
+
+## 1. The Kubernetes resource model
+
+| Built-in | Custom (extension) | What it is |
+|---|---|---|
+| **Resource Definition** | **Custom Resource Definition (CRD)** | The **API schema**: allowed fields, required fields, types |
+| **Resource** | **Custom Resource (CR)** | An instance you create, which must follow the schema or the API rejects it |
+| Controller (some kinds) | Custom controller (optional) | The **brain**: a control loop that makes reality match the resource |
+
+```bash
+kubectl api-resources            # every type the cluster knows (NAME, SHORTNAMES, APIVERSION, NAMESPACED, KIND)
+kubectl api-resources -o wide    # + VERBS (get, list, create…) — essential for writing RBAC
+```
+
+**"Kubernetes is extensible"** means you, a vendor, or an open-source project can add new types with a CRD and create CRs from them. The only difference from the built-ins is the word *custom*.
+
+### Controllers and the reconciliation loop
+
+The control loop is: **observe** desired state → **compare** with current → **act** to close the gap → **repeat forever**.
+
+| Needs a controller (state can drift) | No dedicated controller (static data) |
+|---|---|
+| **Deployment** (with the ReplicaSet controller): keeps N replicas, rolling updates | **ConfigMap**, **Secret**: written once, read by pods |
+| **StatefulSet**: ordered pods, stable identity and storage | **Service**: the **EndpointSlice controller** reacts to pod changes and updates endpoints |
+| **Job**: N pods run to completion | **Namespace**: see the nuance in section 7 |
+| **CronJob**: creates Jobs on a schedule | |
+
+**Custom resources follow the same rule.** If a CR describes ongoing behaviour (e.g. "back up this DB every night"), someone must write a controller. **CRD = API, controller = behaviour.**
+
+### Why this matters for Argo CD
+
+Installing Argo CD (lecture 02) added **3 CRDs + controllers**. So far you've created **zero CRs**. This lecture creates the first one.
+
+```
+NAME              SHORTNAMES        APIVERSION             NAMESPACED   KIND
+applications      app,apps          argoproj.io/v1alpha1   true         Application
+applicationsets   appset,appsets    argoproj.io/v1alpha1   true         ApplicationSet
+appprojects       appproj,appprojs  argoproj.io/v1alpha1   true         AppProject
+```
+
+That's why `kubectl get app -n argocd` works: `app` is a **short name**.
+
+---
+
+## 2. The Application CRD
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/application-crd-dark.svg">
+  <img src="../images/application-crd-light.svg" alt="From CRD to running app" width="760">
+</picture>
+
+*CRD = schema, Application = your instance, controller = the behaviour.*
+
+> An **Application** represents a **deployed application instance** as Argo CD understands it. It's the Kubernetes object through which Argo CD models, tracks and reconciles one app in one environment.
+
+**Git declares the desired state. The Application declares intent. Argo CD enforces that intent continuously.**
+
+### The manifest, field by field
+
+```yaml
+apiVersion: argoproj.io/v1alpha1     # API group/version registered by Argo CD's CRD
+kind: Application                    # the custom kind
+metadata:
+  name: guestbook                    # name INSIDE Argo CD (UI, CLI, RBAC). Needn't match anything else.
+  namespace: argocd                  # where Argo CD runs — NOT where your app runs
+spec:
+  project: default                   # AppProject = policy boundary (lecture 05). "default" allows everything.
+  source:                            # ── WHERE DESIRED STATE LIVES ──
+    repoURL: https://github.com/argoproj/argocd-example-apps.git   # normally your CONFIG repo
+    targetRevision: HEAD             # which commit to track
+    path: guestbook                  # folder inside the repo holding YAML / Helm chart / Kustomize
+  destination:                       # ── WHERE IT SHOULD RUN ──
+    server: https://kubernetes.default.svc   # the cluster's API URL (this = "the cluster Argo CD runs in")
+    namespace: guestbook             # injected into resources that don't set their own namespace
+```
+
+| Field | Key points |
+|---|---|
+| `metadata.namespace` | Must be the Argo CD namespace (by default; see section 7). The Application belongs to Argo CD, not to your app's namespace. |
+| `targetRevision` | `HEAD` = tip of the default branch (`main`/`master`, whatever the repo says). `main` = a branch. `v1.2.0` = a tag. `9fceb02` = a pinned commit. For Helm repos it's the chart version. |
+| `path` | Relative to the repo **root**. A monorepo with 3 services = 3 Applications with 3 different `path`s. |
+| `destination.server` **or** `destination.name` | Identify the cluster by API URL **or** by its registered name, **never both**. `https://kubernetes.default.svc` is the in-cluster address. |
+| `destination.namespace` | Applied to namespaced resources that have no `metadata.namespace` |
+
+> 🔁 In demos, `guestbook` is reused as the app name, the Git folder and the namespace. That's **just for symmetry**. They're independent identifiers.
+
+### Application CR vs your app's manifests
+
+| | **Application resource** | **Kubernetes manifests** |
+|---|---|---|
+| Owned by | Argo CD | Your application |
+| Lives in | Cluster, `argocd` namespace | Git repository |
+| Declares | *What Argo CD should manage, from where, to where* | *What Kubernetes should run* |
+| Reconciled by | Argo CD application controller | Kubernetes controllers (Deployment, …) |
+| Purpose | Git → cluster mapping | Runtime workload definition |
+
+### One Argo CD, many clusters
+
+The `destination` exists because one Argo CD can deploy to many clusters. You'll do that in lecture 10.
+
+---
+
+## 3. Mapping Applications to real architectures
+
+**Rule: one Argo CD Application = one *independently deployable* unit**, i.e. something you want to deploy, roll back and reconcile on its own.
+
+| Architecture | Unit | Repos | Applications | Diagram |
+|---|---|---|---|---|
+| **Microservices** (most common) | each microservice | `ms-1-repo`, `ms-2-repo`, `ms-3-repo` | `ms1-app`, `ms2-app`, `ms3-app` | Each team ships on its own schedule |
+| **Multi-tier** (transitional) | each tier | `web-tier-config`, `app-tier-config` | `web-app`, `app-app` | The DB tier is managed outside Argo CD |
+| **Monolith** (rare on K8s) | the whole thing | one | one | — |
+
+**About the DB tier in a multi-tier setup:** it's a **managed service (Amazon RDS)**, so it's **not deployed by Argo CD**. Pods reach it through a stable in-cluster name, e.g. an **`ExternalName` Service** (a DNS CNAME to the RDS endpoint). This is the standard stateful pattern: **Terraform owns RDS, Argo CD owns the app plus the pointer to RDS.**
+
+**Common recommendation:** *10 microservices → 10 repos → 10 Applications.* That gives clear ownership, fine-grained RBAC, a small blast radius and independent rollbacks. (A common alternative, the GitOps monorepo, is in section 7.)
+
+---
+
+## 4. Sync status vs health status
+
+| **Sync status**: *does live = Git?* | **Health status**: *is it working?* |
+|---|---|
+| **Synced**: live matches Git | **Healthy**: running as expected |
+| **OutOfSync**: drift (missing, extra or different) | **Progressing**: rolling out, not ready yet |
+| **Unknown**: can't compare (repo unreachable, render error) | **Degraded**: failed, e.g. CrashLoopBackOff or failed rollout |
+| | **Missing**: in Git, not in the cluster |
+| | **Suspended**: paused (suspended CronJob, paused rollout) |
+| | **Unknown**: no health check available |
+
+> If you put a broken manifest in Git, Argo CD will happily apply it. Making your manifests work is **your** responsibility. So **Synced + Degraded** is a normal, meaningful state: Argo CD did its job and your YAML or image is broken.
+
+UI icons: 💚 heart = health, ✅ tick / 🔄 arrows = sync.
+
+---
+
+## 5. Hands-on lab (local k3d)
+
+### Session start
+
+[00-lab-setup.md section 5](00-lab-setup.md#5-session-routine-every-lab):
+```bash
+# terminal 1
+k3d cluster start dev
+kubectl get pods -n argocd                     # all Running?
+kubectl port-forward svc/my-argo-cd-argocd-server -n argocd 8443:443   # → https://localhost:8443
+```
+```bash
+# terminal 2: work here (terminal 3 later for the app port-forward)
+cd <this repo> && export NOTES=$PWD
+argocd login localhost:8443 --insecure --username admin
+```
+
+### Lab 3A: explore the API surface
+
+```bash
+kubectl api-resources | head -20
+kubectl api-resources | grep -i argo
+kubectl api-resources -o wide | grep -i argo        # note the VERBS column
+kubectl explain application.spec.source              # schema docs, straight from the CRD
+kubectl explain application.spec.destination
+kubectl get app -n argocd                            # "No resources found" — zero CRs yet
+```
+- **Why `kubectl explain`:** it reads the CRD's OpenAPI schema, the same schema the API server validates against. It's your offline field reference.
+
+### Lab 3B: first Application
+
+Create `~/devs/03/guestbook-app.yaml` with the manifest from section 2 (or copy [`labs/03-application-crd/guestbook-app.yaml`](../labs/03-application-crd/guestbook-app.yaml)). **Typing it yourself once is worth it.**
+
+```bash
+mkdir -p ~/devs/03 && cd ~/devs/03
+cp "$NOTES/labs/03-application-crd/guestbook-app.yaml" .     # or write it yourself
+kubectl apply -f guestbook-app.yaml
+kubectl get app -n argocd
+```
+- **What:** you're creating a CR. The **application controller** notices it, asks the **repo server** to clone the repo and render `guestbook/`, then compares the result with the cluster.
+- **Expect:** `guestbook   OutOfSync   Missing`. Desired state exists, live state doesn't, and nothing happens on its own, because **sync is manual** (no `syncPolicy`).
+
+**In the UI** (https://localhost:8443): open `guestbook` → click `guestbook-ui` (Deployment) → **Desired Manifest** tab. Then open the same file on GitHub: <https://github.com/argoproj/argocd-example-apps/tree/master/guestbook>.
+
+🔍 **Spot two differences:** the desired manifest in Argo CD has a `namespace: guestbook` and an Argo CD **annotation** that the Git file doesn't have.
+
+<details><summary>Why?</summary>
+
+- **namespace**: injected from `spec.destination.namespace`, because the Git manifest has none. That keeps the manifests **environment-agnostic**: the same YAML can go to `dev`, `stage` or `prod` by changing only the Application.
+- **annotation** (`argocd.argoproj.io/tracking-id`): Argo CD's **resource tracking** marker, `<app>:<group>/<kind>:<ns>/<name>`. It's how Argo CD knows "this live object belongs to app `guestbook`". Pruning (lecture 04) depends on it. Kubernetes itself ignores annotations; tools read them.
+</details>
+
+### Lab 3C: the expected failure, then success
+
+UI → **Sync → Synchronize**.
+- **Expect:** ❌ sync failed, `namespaces "guestbook" not found`.
+- **Why:** by default Argo CD **doesn't create the destination namespace**. It only applies what's in Git, and the namespace isn't in Git.
+
+```bash
+kubectl create ns guestbook
+```
+UI → **Sync → Synchronize** again → ✅ **Synced + Healthy**.
+
+Explore the tree: Deployment → ReplicaSet → Pod (each one wraps the next), plus the Service. Also try the **Events**, **Logs**, **Diff** and **History and Rollback** buttons.
+
+```bash
+kubectl get all -n guestbook
+kubectl get deploy guestbook-ui -n guestbook -o yaml | grep -A3 annotations   # the tracking annotation, live
+```
+
+### Lab 3D: open the app
+
+Terminal 3:
+```bash
+kubectl port-forward svc/guestbook-ui -n guestbook 8081:80
+```
+→ http://localhost:8081. It's a static demo page; the submit button does nothing, which is expected. Port 8081 keeps app traffic apart from Argo CD (8443) and k3d's Traefik (8080).
+
+### Lab 3E: drift **without** auto-sync (important)
+
+**Predict first:** you scale the Deployment by hand. Will Argo CD revert it?
+
+```bash
+kubectl scale deploy guestbook-ui -n guestbook --replicas=3
+kubectl get pods -n guestbook
+kubectl get app guestbook -n argocd
+```
+- **Expect:** **3 pods keep running.** The app turns **OutOfSync** (Argo CD *detects* the drift) but **doesn't fix it**.
+- UI → `guestbook-ui` → **Diff**: Git says `replicas: 1`, live says `3`.
+- Now **Sync** → back to 1 pod.
+
+> 💡 This is the lecture 01 nuance in action: **detecting** drift is always on, **correcting** it needs `selfHeal` (lecture 04). With manual sync, Argo CD is a drift *alarm*, not a drift *fixer*.
+
+### Lab 3F: `CreateNamespace=true` and reusing the same manifests
+
+Create `guestbook-dev-app.yaml` (or copy [`labs/03-application-crd/guestbook-dev-app.yaml`](../labs/03-application-crd/guestbook-dev-app.yaml)). It's the **same Git path**, deployed to a **different namespace**, and Argo CD creates the namespace:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: guestbook-dev
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/argoproj/argocd-example-apps.git
+    targetRevision: HEAD
+    path: guestbook
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: guestbook-dev
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true     # let Argo CD create guestbook-dev if missing
+```
+```bash
+kubectl apply -f guestbook-dev-app.yaml
+```
+UI → `guestbook-dev` → **Sync**. ✅ It succeeds first time. Then:
+```bash
+kubectl get ns guestbook-dev
+kubectl get pods -A | grep guestbook
+```
+- **What you proved:**
+  1. `CreateNamespace=true` removes the manual step.
+  2. **Namespace-free manifests let one Git path feed many environments.** The only differences live in the Application.
+- Note that `syncOptions` is **not** auto-sync. You still clicked Sync.
+
+### Lab 3G: argocd CLI equivalents (optional, recommended)
+
+With the UI port-forward running in terminal 1:
+```bash
+argocd login localhost:8443 --insecure --username admin
+argocd app list
+argocd app get guestbook              # sync + health + every resource
+argocd app diff guestbook             # exit code 0 = no diff, 1 = diff (handy in scripts)
+argocd app history guestbook          # every sync = a revision you can roll back to
+argocd app sync guestbook             # same as the UI button
+```
+
+### Lab 3H: the delete trap (predict first!)
+
+You'll delete two Applications in two different ways. **Before running anything, write down** what happens to the pods in `guestbook-dev` and in `guestbook`.
+
+```bash
+# Way 1: delete the Application CR with kubectl
+kubectl delete app guestbook-dev -n argocd
+kubectl get pods -n guestbook-dev
+```
+<details><summary>Result and why</summary>
+
+**Pods are still running.** The Application CR is gone but its resources are **orphaned**. Without the finalizer `resources-finalizer.argocd.argoproj.io` on the Application, deleting the CR doesn't cascade to the resources it managed.
+
+Clean up the orphans: `kubectl delete ns guestbook-dev`.
+</details>
+
+```bash
+# Way 2: delete with the argocd CLI
+argocd app delete guestbook --yes
+kubectl get pods -n guestbook
+```
+<details><summary>Result and why</summary>
+
+**Pods are deleted.** `argocd app delete` cascades by default: it removes the managed resources, then the Application. (Use `--cascade=false` to orphan instead.) The `guestbook` *namespace* remains, because you created it by hand, so Argo CD never managed it: `kubectl delete ns guestbook`.
+
+**Production lesson:** declaratively-managed Applications usually carry
+```yaml
+metadata:
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+```
+so deleting the CR cleans up properly. For **stateful** apps, that same finalizer means deleting the Application **deletes the PVCs, and with them your data**. Know which behaviour you want before you delete anything.
+</details>
+
+### Lab 3I: write one yourself (exercise)
+
+Without copying, write an Application named `helm-guestbook` that deploys the **`helm-guestbook`** folder of the same repo into namespace `helm-gb`, creating the namespace automatically. Apply it, sync it, and check that it turns green.
+
+<details><summary>Answer</summary>
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: helm-guestbook
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/argoproj/argocd-example-apps.git
+    targetRevision: HEAD
+    path: helm-guestbook
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: helm-gb
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+```
+**Notice:** you didn't tell Argo CD it's a Helm chart. The **repo server auto-detects** `Chart.yaml` in the path and renders it with `helm template`. In the UI the app's **source type** shows *Helm*. Lecture 08 goes deep on this.
+
+Cleanup: `argocd app delete helm-guestbook --yes && kubectl delete ns helm-gb`
+</details>
+
+### End of session
+
+```bash
+argocd app list                       # should be empty after 3H/3I cleanup (or keep what you like)
+k3d cluster stop dev           # Ctrl+C the port-forwards first
+```
+
+---
+
+## 6. Hand-written notes check (do this on paper)
+
+Draw: `Application CR (argocd ns)` → `repo server` → `GitHub path` → rendered YAML → `application controller` → diff with live → `sync` → resources in `guestbook` ns. Label where the namespace and the annotation get injected.
+
+---
+
+## 7. Production reality and pitfalls
+
+### Common claims, with nuance
+
+| Common claim | Nuance |
+|---|---|
+| Applications **must** be in the Argo CD namespace | True **by default**. Since Argo CD 2.5 there's **"Applications in any namespace"**: allow extra namespaces via the `application.namespaces` setting, and teams can keep Application CRs in their own namespaces, still constrained by AppProjects. Useful for multi-tenant self-service. |
+| ConfigMap, Secret, Service, Namespace "have no controller" | A good mental model, but not literally true. The **namespace controller** deletes everything inside a namespace when you delete it. The **service controller** (cloud-controller-manager) creates the AWS load balancer for `type: LoadBalancer`. ServiceAccounts have a token controller. The point stands: *controllers exist where behaviour must be enforced.* |
+| "Teams rarely put multiple apps in one repo" | Both patterns are common. **Polyrepo** (a repo per service) gives strong isolation. **Monorepo GitOps** (one `platform-gitops` repo, a folder per app and env, generated by **ApplicationSets**) is extremely popular at scale, and it's what our capstone uses. Ownership is enforced with `CODEOWNERS` per folder. |
+| `ExternalName` Service for RDS | It works (it's a DNS CNAME), but there's a **TLS gotcha**: if the app verifies the DB certificate (`sslmode=verify-full`), the hostname it connects to (`catalog-db.svc…`) won't match the RDS certificate. Many teams instead inject the **real RDS endpoint** as config or secret (via ESO), which we'll do in module 11. |
+| Health statuses list | Health checks are built in for core kinds. For **CRDs** (e.g. a cert-manager `Certificate`), Argo CD has bundled or custom **Lua health checks**. Without one, the status shows Healthy or Unknown, which might hide real problems. |
+
+### What changes in real companies
+
+- **Applications are never `kubectl apply`'d by hand.** They live in Git too, and a root "app of apps" or an ApplicationSet creates them (lectures 09 and 10). Otherwise your GitOps setup itself isn't GitOps.
+- **`targetRevision: HEAD` in prod is risky:** any merge to the default branch ships immediately. Common patterns: a branch per environment (`targetRevision: prod`), folders per environment on `main` (`path: apps/catalog/overlays/prod`), or **tags** for controlled releases.
+- **Namespaces as first-class config:** instead of `CreateNamespace=true` (which makes a bare namespace), platform teams usually manage `Namespace` objects in Git with **labels** (Pod Security, NetworkPolicy selectors), a **ResourceQuota** and a **LimitRange**. `CreateNamespace=true` can add labels via `managedNamespaceMetadata`. Lecture 07 orders these with sync waves.
+- **Finalizers on purpose:** add `resources-finalizer.argocd.argoproj.io` to stateless apps so deletion cleans up. For stateful apps, combine it with `Prune=false` or `Delete=false` on PVCs (sync-option annotations) so deleting an app never deletes data.
+
+### Stateful lens
+
+| Capstone piece | Lives in the Application? |
+|---|---|
+| `catalog` Deployment, Service, HPA | ✅ yes |
+| `ExternalSecret` (pointer to DB credentials) | ✅ yes |
+| RDS MySQL instance | ❌ **Terraform.** The Application only references its endpoint. |
+| RabbitMQ StatefulSet + PVC | ✅ yes, **with delete protection** on the PVC |
+
+### Common mistakes
+
+1. Creating the Application in the app's namespace → Argo CD ignores it (default config).
+2. Hard-coding `metadata.namespace` in every manifest → can't reuse them across environments, and the Application's `destination.namespace` is silently overridden.
+3. Treating **Synced** as "it works". Always check **Health** too.
+4. Deleting an Application with `kubectl` and assuming the workload is gone (orphans), or the reverse: a finalizer wiping stateful data.
+5. `path` typos → **Unknown** / `ComparisonError: app path does not exist`.
+
+---
+
+## 8. Revision kit
+
+### Command cheat sheet
+
+| Command | Purpose |
+|---|---|
+| `kubectl api-resources [-o wide] \| grep -i argo` | Argo CD's CRDs, short names, verbs |
+| `kubectl explain application.spec.source` | Field docs from the CRD schema |
+| `kubectl apply -f app.yaml` | Create or update an Application CR |
+| `kubectl get app -n argocd` | Sync + health at a glance |
+| `kubectl describe app <name> -n argocd` | Conditions and errors (e.g. ComparisonError) |
+| `argocd app get / diff / sync / history <name>` | Inspect / compare / sync / revisions |
+| `argocd app delete <name> [--cascade=false]` | Delete app (+ resources by default) |
+| `kubectl port-forward svc/guestbook-ui -n guestbook 8081:80` | Reach the demo app |
+
+### Self-test
+
+<details><summary><b>Q1.</b> Resource Definition vs Resource vs CRD vs CR?</summary>
+
+A Resource Definition is a built-in API schema (e.g. Deployment); a Resource is an instance of it. A CRD is a user- or vendor-defined schema; a CR is an instance of a CRD. Both kinds of instance must conform to their schema or the API rejects them.
+</details>
+
+<details><summary><b>Q2.</b> Does creating a CRD make Kubernetes do anything?</summary>
+
+No. It only lets the API store and validate CRs of that kind. A controller must watch them and act (Operator pattern = CRD + controller).
+</details>
+
+<details><summary><b>Q3.</b> Why does a Deployment need a controller but a ConfigMap doesn't?</summary>
+
+A Deployment describes ongoing behaviour (N replicas, rollouts) that can drift as pods die. A ConfigMap is static data consumed by pods; there's nothing to keep enforcing.
+</details>
+
+<details><summary><b>Q4.</b> What two references define an Application?</summary>
+
+**Source** (repoURL + targetRevision + path: the desired state in Git) and **destination** (server or name + namespace: where to apply it).
+</details>
+
+<details><summary><b>Q5.</b> Which namespace does the Application CR go in, and which namespace do the pods go in?</summary>
+
+The CR goes in `argocd` (the Argo CD install namespace, by default). Pods go in `spec.destination.namespace` (e.g. `guestbook`).
+</details>
+
+<details><summary><b>Q6.</b> What does <code>targetRevision: HEAD</code> mean? Give 3 other valid values.</summary>
+
+The latest commit of the repo's default branch. Others: a branch (`main`), a tag (`v1.2.0`), a commit SHA (`9fceb02`). For Helm repos, a chart version.
+</details>
+
+<details><summary><b>Q7.</b> Why did the first sync fail, and what are 2 fixes?</summary>
+
+The destination namespace didn't exist, and Argo CD doesn't create it by default. Fixes: create it (`kubectl create ns`, or better, a `Namespace` manifest in Git), or add `syncOptions: [CreateNamespace=true]`.
+</details>
+
+<details><summary><b>Q8.</b> Two things Argo CD adds to manifests that weren't in Git?</summary>
+
+`metadata.namespace` (from the destination, when the manifest has none) and the tracking annotation `argocd.argoproj.io/tracking-id`.
+</details>
+
+<details><summary><b>Q9.</b> An app is Synced but Degraded. Whose problem is it?</summary>
+
+Yours (the manifests or image). Argo CD applied exactly what Git says; the workload itself is unhealthy, e.g. CrashLoopBackOff or a bad image tag.
+</details>
+
+<details><summary><b>Q10.</b> You scale a managed Deployment by hand and the app has no syncPolicy. What happens?</summary>
+
+The change sticks. The app shows OutOfSync with a diff; nothing reverts it until someone syncs. Automatic correction needs `syncPolicy.automated.selfHeal: true`.
+</details>
+
+<details><summary><b>Q11.</b> 3 microservices in one repo under folders ms1/, ms2/, ms3/. How many Applications?</summary>
+
+Three, one per independently deployable unit, each with a different `path`.
+</details>
+
+### Interview questions
+
+<details><summary><b>I1.</b> "What is an operator? Is Argo CD one?"</summary>
+
+An operator is a CRD (an API for a domain concept) plus a controller that continuously reconciles CRs into real-world state. Argo CD qualifies: CRDs `Application`, `AppProject`, `ApplicationSet` and controllers that reconcile Git into clusters.
+</details>
+
+<details><summary><b>I2.</b> "Walk me through what happens after <code>kubectl apply</code> of an Application."</summary>
+
+The API server validates it against the CRD schema and stores it. The application controller sees the new CR, asks the repo server to fetch the repo at targetRevision and render the path (YAML, Helm, Kustomize), and gets back manifests (with the destination namespace). It compares them with the live objects in the destination cluster and sets sync status (OutOfSync/Missing) and health. With manual sync it waits; on sync, it applies the manifests with tracking annotations and keeps comparing on every reconcile cycle.
+</details>
+
+<details><summary><b>I3.</b> "How do you structure Applications for 20 microservices across dev/stage/prod?"</summary>
+
+One Application per service per environment (60 apps), never hand-created. Generate them with an ApplicationSet (git directory or matrix generator) over either per-service repos or a monorepo with `apps/<svc>/overlays/<env>`. Use AppProjects per team for RBAC and destination limits. Prod tracks a protected branch, folder or tags.
+</details>
+
+<details><summary><b>I4.</b> "Someone deleted an Application and the pods are still running. Why? And the opposite case?"</summary>
+
+The Application had no `resources-finalizer.argocd.argoproj.io` (e.g. it was deleted with kubectl), so the resources were orphaned. The opposite: with the finalizer, or via `argocd app delete` (cascade by default), all managed resources are deleted, including PVCs. For stateful workloads, protect PVCs (`Prune=false`/`Delete=false` annotations, `Retain` reclaim policy) and use deletion RBAC.
+</details>
+
+<details><summary><b>I5.</b> "How does Argo CD know which live resources belong to which app?"</summary>
+
+Resource tracking: by default, the annotation `argocd.argoproj.io/tracking-id` (older versions used the `app.kubernetes.io/instance` label). It's used for the tree view, diffing and **pruning**, so two Applications must never manage the same resource.
+</details>
+
+---
+
+## 9. Before lecture 04
+
+- [ ] Labs 3A–3I done (3E, 3F and 3H are the important extras)
+- [ ] Can write an Application manifest from memory (Q4–Q6)
+- [ ] Cluster stopped (`k3d cluster stop dev`)
+- [ ] Lecture 04 uses **private** GitHub repos, a private Docker Hub repo and a PAT. Have your GitHub and Docker Hub accounts ready. Images are built by GitHub Actions.

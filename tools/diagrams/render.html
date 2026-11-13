@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>render diagrams</title>
+<!-- Opened headless by tools/render-diagrams.mjs. Draws every spec in specs.js twice (light, dark)
+     with rough.js, embeds a Kalam font subset, and writes the SVG strings into #out as JSON. -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Kalam:wght@400;700&display=swap">
+</head>
+<body>
+<div id="stage"></div>
+<script type="application/json" id="out"></script>
+<script src="https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.js"></script>
+<script src="specs.js"></script>
+<script>
+window.onerror = function (m) { document.title = 'ERR:' + m; };
+(async function () {
+  var NS = 'http://www.w3.org/2000/svg';
+  var PALETTES = {
+    light: { paper: '#FAF9F5', ink: '#1F1E1D', 'ink-2': '#3D3A33', muted: '#6B675D', clay: '#C15F3C', 'clay-fill': '#F6DFD4',
+             sky: '#3F6F99', 'sky-fill': '#DCE7F2', sage: '#4F7D56', 'sage-fill': '#DDEADB', sand: '#A57A1E', 'sand-fill': '#F2E6C8', 'plain-fill': '#FFFFFF' },
+    dark:  { paper: '#1C1B19', ink: '#ECE9E1', 'ink-2': '#D3CFC4', muted: '#A39F94', clay: '#E07B57', 'clay-fill': '#4A2D22',
+             sky: '#8CB3D8', 'sky-fill': '#22303D', sage: '#92BE97', 'sage-fill': '#233428', sand: '#D9B35E', 'sand-fill': '#3B3121', 'plain-fill': '#2A2925' }
+  };
+  var TONES = { accent: ['clay-fill', 'clay'], sky: ['sky-fill', 'sky'], sage: ['sage-fill', 'sage'], sand: ['sand-fill', 'sand'], plain: ['plain-fill', 'ink-2'] };
+  var FONT = 'Kalam, "Segoe Print", "Comic Sans MS", cursive';
+
+  // ---- embed a Kalam subset (only the glyphs used) so the SVGs look the same everywhere ----
+  var chars = {};
+  Object.keys(DIAGRAMS).forEach(function (k) {
+    var s = DIAGRAMS[k];
+    (s.nodes || []).forEach(function (n) { (n.label || '').split('').forEach(function (c) { chars[c] = 1; }); });
+    (s.edges || []).forEach(function (e) { (e.label || '').split('').forEach(function (c) { chars[c] = 1; }); });
+    (s.texts || []).forEach(function (t) { t.t.split('').forEach(function (c) { chars[c] = 1; }); });
+  });
+  var fontCss = '';
+  document.title = 'stage:font';
+  try {
+    var glyphs = Object.keys(chars).filter(function (c) { return c !== '\n'; }).join('');
+    var css = await (await fetch('https://fonts.googleapis.com/css2?family=Kalam:wght@400;700&text=' + encodeURIComponent(glyphs))).text();
+    var faces = css.split('@font-face').slice(1);
+    for (var i = 0; i < faces.length; i++) {
+      var url = (faces[i].match(/url\(([^)]+)\)/) || [])[1];
+      var weight = (faces[i].match(/font-weight:\s*(\d+)/) || [])[1] || '400';
+      if (!url) continue;
+      var buf = await (await fetch(url)).arrayBuffer();
+      var bin = ''; var bytes = new Uint8Array(buf);
+      for (var j = 0; j < bytes.length; j++) bin += String.fromCharCode(bytes[j]);
+      var fmt = /\.woff2/.test(url) || /woff2/.test(faces[i]) ? 'woff2' : 'truetype';
+      fontCss += "@font-face{font-family:'Kalam';font-weight:" + weight + ";src:url(data:font/" + fmt + ";base64," + btoa(bin) + ") format('" + fmt + "');}";
+    }
+  } catch (e) { fontCss = ''; document.title = 'fonterr:' + e; }
+  document.title = 'stage:draw';
+
+  function text(svg, x, y, str, o) {
+    var t = document.createElementNS(NS, 'text');
+    t.setAttribute('x', x); t.setAttribute('y', y);
+    t.setAttribute('font-family', FONT);
+    t.setAttribute('font-size', o.size || 15);
+    t.setAttribute('font-weight', o.weight || 400);
+    t.setAttribute('fill', o.fill);
+    t.setAttribute('text-anchor', o.anchor || 'start');
+    t.textContent = str;
+    svg.appendChild(t);
+  }
+  function side(n, s) {
+    if (s === 'l') return [n.x, n.y + n.h / 2];
+    if (s === 'r') return [n.x + n.w, n.y + n.h / 2];
+    if (s === 't') return [n.x + n.w / 2, n.y];
+    return [n.x + n.w / 2, n.y + n.h];
+  }
+  function autoSides(a, b) {
+    if (b.x >= a.x + a.w) return ['r', 'l'];
+    if (b.x + b.w <= a.x) return ['l', 'r'];
+    if (b.y >= a.y + a.h) return ['b', 't'];
+    return ['t', 'b'];
+  }
+
+  function draw(spec, T) {
+    var svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('xmlns', NS);
+    svg.setAttribute('viewBox', '0 0 ' + spec.w + ' ' + spec.h);
+    svg.setAttribute('width', spec.w); svg.setAttribute('height', spec.h);
+    svg.setAttribute('role', 'img');
+    var title = document.createElementNS(NS, 'title'); title.textContent = spec.alt || ''; svg.appendChild(title);
+    if (fontCss) { var st = document.createElementNS(NS, 'style'); st.textContent = fontCss; svg.appendChild(st); }
+    var bg = document.createElementNS(NS, 'rect');
+    bg.setAttribute('width', spec.w); bg.setAttribute('height', spec.h); bg.setAttribute('rx', 12); bg.setAttribute('fill', T.paper);
+    svg.appendChild(bg);
+    var rc = rough.svg(svg), seed = 11, byId = {};
+    var base = { roughness: 1.1, bowing: 1.1, strokeWidth: 1.6 };
+    function opt(extra) { var o = {}, k; for (k in base) o[k] = base[k]; for (k in extra) o[k] = extra[k]; o.seed = seed++; return o; }
+
+    spec.nodes.forEach(function (n) {
+      byId[n.id] = n;
+      var tone = TONES[n.tone || 'plain'], fill = T[tone[0]], stroke = T[tone[1]];
+      if (n.kind === 'group') {
+        svg.appendChild(rc.rectangle(n.x, n.y, n.w, n.h, opt({ stroke: stroke, strokeWidth: 1.5, strokeLineDash: [9, 7], roughness: 0.9 })));
+        text(svg, n.x + 14, n.y + 24, n.label, { size: 14, weight: 700, fill: stroke });
+        return;
+      }
+      var o = opt({ stroke: stroke, fill: fill, fillStyle: 'solid', strokeWidth: n.tone === 'accent' ? 2.2 : 1.6 });
+      if (n.dash) o.strokeLineDash = [8, 6];
+      if (n.shape === 'db') {
+        svg.appendChild(rc.rectangle(n.x, n.y + 8, n.w, n.h - 8, o));
+        svg.appendChild(rc.ellipse(n.x + n.w / 2, n.y + 9, n.w, 18, opt({ stroke: stroke, fill: fill, fillStyle: 'solid', strokeWidth: 1.6 })));
+      } else {
+        svg.appendChild(rc.rectangle(n.x, n.y, n.w, n.h, o));
+      }
+      if (!n.label) return;
+      var lines = n.label.split('\n'), lh = 18, first = 20;
+      var total = first + (lines.length - 1) * lh;
+      var cy = n.y + n.h / 2 + (n.shape === 'db' ? 5 : 0);
+      var y = cy - total / 2 + 15;
+      lines.forEach(function (ln, i) {
+        text(svg, n.x + n.w / 2, y, ln, { size: i === 0 ? 17 : 13.5, weight: i === 0 ? 700 : 400, fill: i === 0 ? T.ink : T['ink-2'], anchor: 'middle' });
+        y += i === 0 ? first + 1 : lh;
+      });
+    });
+
+    (spec.edges || []).forEach(function (e) {
+      var pts;
+      if (e.pts) pts = e.pts;
+      else {
+        var a = byId[e.from], b = byId[e.to], s = autoSides(a, b);
+        pts = [side(a, e.fs || s[0]), side(b, e.ts || s[1])];
+      }
+      var o = opt({ stroke: T.muted, strokeWidth: 1.6, roughness: 0.9 });
+      if (e.dash) o.strokeLineDash = [7, 6];
+      if (pts.length === 2) svg.appendChild(rc.line(pts[0][0], pts[0][1], pts[1][0], pts[1][1], o));
+      else svg.appendChild(rc.linearPath(pts, o));
+      var p = pts[pts.length - 1], q = pts[pts.length - 2];
+      var ang = Math.atan2(p[1] - q[1], p[0] - q[0]);
+      var head = opt({ stroke: T.muted, strokeWidth: 1.6, roughness: 0.6 });
+      [0.45, -0.45].forEach(function (d) {
+        svg.appendChild(rc.line(p[0], p[1], p[0] - 13 * Math.cos(ang + d), p[1] - 13 * Math.sin(ang + d), head));
+      });
+      if (e.label) {
+        var mi = Math.floor((pts.length - 1) / 2), m0 = pts[mi], m1 = pts[mi + 1];
+        var mx = (m0[0] + m1[0]) / 2, my = (m0[1] + m1[1]) / 2, wpx = e.label.length * 7.2 + 12;
+        var r = document.createElementNS(NS, 'rect');
+        r.setAttribute('x', mx - wpx / 2); r.setAttribute('y', my - 11); r.setAttribute('width', wpx); r.setAttribute('height', 20);
+        r.setAttribute('rx', 4); r.setAttribute('fill', T.paper);
+        svg.appendChild(r);
+        text(svg, mx, my + 4, e.label, { size: 13, fill: T.muted, anchor: 'middle' });
+      }
+    });
+
+    (spec.texts || []).forEach(function (t) {
+      text(svg, t.x, t.y, t.t, { size: t.size, weight: t.weight, anchor: t.anchor, fill: T[t.c || 'ink'] });
+    });
+    return new XMLSerializer().serializeToString(svg);
+  }
+
+  var out = { fontEmbedded: !!fontCss, svgs: {} };
+  var cur = '';
+  try {
+    Object.keys(DIAGRAMS).forEach(function (k) {
+      cur = k;
+      out.svgs[k + '-light'] = draw(DIAGRAMS[k], PALETTES.light);
+      out.svgs[k + '-dark'] = draw(DIAGRAMS[k], PALETTES.dark);
+    });
+  } catch (e) { document.title = 'ERR in ' + cur + ': ' + e; return; }
+  document.getElementById('out').textContent = JSON.stringify(out);
+  document.title = 'DONE';
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,119 @@
+# Argo CD Key Points: one-page revision
+
+> The ideas worth remembering from every lecture, plus the commands used most. Read it before an interview or before starting the next lecture. Details are in [`notes/`](notes).
+
+---
+
+## 01 · GitOps
+
+- **GitOps is an operating model, not a tool.** Argo CD and Flux *implement* it.
+- **Four OpenGitOps principles:** declarative, versioned and immutable, **pulled** automatically, **continuously reconciled**. A pipeline running `kubectl apply` is push-based and *not* GitOps.
+- **Desired state** (Git) vs **live state** (cluster). The difference is **drift**.
+- **Two repos:** the app repo (code, Dockerfile, CI that builds and publishes an image, **never deploys**) and the config repo (manifests that a controller **pulls**).
+- **The handoff:** CI publishes the image, then acts as a *Git user* and opens a PR bumping the tag or digest in the config repo. The merge is the deploy decision.
+- **Pull model security:** CI holds no cluster credentials.
+- **Rollback = `git revert`** (a new commit, history kept). It doesn't undo database migrations or deleted data.
+- **Tags are mutable, digests (`@sha256:`) aren't.** Pin digests in production.
+
+## 02 · Architecture and install
+
+- Argo CD is **Kubernetes-native**: CRDs (`Application`, `AppProject`, `ApplicationSet`) + controllers.
+- **Core:** **API server** (UI/CLI/API, auth), **repo server** (clones Git, renders Helm/Kustomize/YAML, never touches the cluster), **application controller** (the heart: desired vs live, sync, self-heal, hooks; a StatefulSet so it can shard).
+- **Supporting:** Redis (**cache only**: delete it and nothing is lost), ApplicationSet controller, Dex (SSO), notifications controller.
+- **Argo CD users ≠ cluster users.** Developers and CI talk to the Argo CD API; only the controller applies resources.
+- **Install:** Helm, **pinned chart version** (chart version ≠ app version), own namespace, change the admin password and delete `argocd-initial-admin-secret`.
+- **Argo CD down ≠ apps down.** It isn't in the data path; only syncing and drift correction stop.
+
+## 03 · The Application CRD
+
+- **CRD = API schema, CR = an instance, controller = the behaviour.**
+- An `Application` lives in the **`argocd` namespace** and says: **source** (`repoURL`, `targetRevision`, `path`) → **destination** (`server` or `name`, `namespace`) under a **project**.
+- `destination.namespace` is injected only into resources **without** their own namespace. Namespace-free manifests let one path feed many environments.
+- **Sync status** (Synced / OutOfSync / Unknown) ≠ **health** (Healthy / Progressing / Degraded / Missing). **Synced + Degraded** is normal: Argo CD applied a broken app.
+- `CreateNamespace=true` is a **sync option**, not auto-sync.
+- **Without auto-sync, drift is detected but not fixed** (OutOfSync).
+- **Delete trap:** `kubectl delete app` **orphans** resources unless the app has the finalizer `resources-finalizer.argocd.argoproj.io`; `argocd app delete` cascades. With PVCs, cascade = data loss.
+- Source type is **auto-detected**: `Chart.yaml` → Helm, `kustomization.yaml` → Kustomize, else plain YAML.
+- Every managed resource carries `argocd.argoproj.io/tracking-id`. That's how Argo CD knows what belongs to which app.
+
+## 04 · Private repos, auto-sync, prune, self-heal
+
+- Argo CD needs **read** access to the **config repo only**. Repo credentials are Secrets labelled `argocd.argoproj.io/secret-type=repository`.
+- **Credential ladder:** PAT (belongs to a person) → machine user → **deploy key** (belongs to one repo, read-only, no human) → **GitHub App** (best for orgs).
+- Fine-grained PAT for Argo CD needs **Contents: Read-only**. Docker Hub pull token: **Read-only** (not "Public Repo Read-only").
+- **Image pull Secret** (`docker-registry` type) is namespaced and only **base64**, not encrypted. Imperative secrets break "everything in Git"; External Secrets fix that later.
+- **Test a credential directly** against GitHub or the registry with `curl` before blaming Argo CD.
+- **automated** = apply new commits; **prune** = delete what was removed from Git; **selfHeal** = revert live edits within seconds (the controller *watches* live objects; only Git is polled, ~3 min).
+- **Auto-sync makes one attempt per commit SHA**, and sync options are fixed when a sync starts. Change behaviour in one commit, destructive changes in the next.
+- **Self-managed Application** (`path: .` includes its own manifest): uncommitted changes to it are reverted. Commit first.
+- **Hotfix:** fix in Git; break-glass = disable self-heal, patch, commit, re-enable. **Rollback:** `git revert` (UI rollback is refused while auto-sync is on).
+- HPA vs `replicas`: `ignoreDifferences`. Keep PVCs: `argocd.argoproj.io/sync-options: Prune=false`.
+
+## 05 · AppProjects
+
+- An **AppProject** is a guardrail, not a namespace. It answers: **where from** (`sourceRepos`), **where to** (`destinations`), **what kinds** (cluster/namespace white- and blacklists), **who** (roles).
+- **Implicit deny:** cluster-scoped kinds need a whitelist entry; once `namespaceResourceWhitelist` exists, unlisted namespaced kinds are denied.
+- Repo and destination violations → `InvalidSpecError`, nothing deployed. Kind violations → the **whole sync fails before anything is applied**.
+- `sourceRepos` must match the Application's `repoURL` **as a string** (`git@…` ≠ `https://…`).
+- **"Argo CD can read it" ≠ "the project trusts it".**
+- **Argo CD RBAC ≠ Kubernetes RBAC.** Sync, refresh and rollback are Argo CD verbs. Policies: `p, <subject>, applications, <action>, <project>/<app>, allow`; `g, <user>, <role>`.
+- `policy.default: ""` = new users see **nothing** (hidden, not "denied", so names don't leak). Project role `groups` are SSO groups; local accounts have none.
+- **Lock down the `default` project**, or anyone escapes the guardrails with `project: default`.
+- The platform team owns projects in a **separate repo**: app teams can't widen their own guardrails.
+
+## 06 · Sync phases and hooks
+
+- **Sync succeeded = every manifest was accepted by the API server.** It says nothing about pods working.
+- **Phases:** PreSync → Sync (your manifests) → PostSync (only after **Healthy**); any failure → SyncFail.
+- **Hook** = a resource (almost always a **Job**) with `argocd.argoproj.io/hook: <Type>`. Run once at its phase, **not reconciled**, **not compared** (a hook-only commit doesn't trigger auto-sync).
+- **Types:** PreSync (migrations, checks), Sync (rare), PostSync (smoke tests), SyncFail (alerts), PostDelete (external cleanup after app deletion), **Skip** (don't apply this manifest).
+- **Delete policy:** use `BeforeHookCreation,HookSucceeded`. Setting any policy replaces the default (`BeforeHookCreation`).
+- Hook Jobs need `backoffLimit: 0`, `activeDeadlineSeconds`, a pinned image.
+- **PreSync fails → nothing changes**, old version keeps serving. **PostSync fails → the new version is already live** (no rollback).
+- **PreSync vs init container:** once per sync, before anything is applied, vs every pod start (4 replicas = 4 racing migrations).
+- Migrations must be **idempotent** and **backward compatible** (expand → migrate → contract): the old pods still serve during and after.
+- Hooks obey the AppProject: whitelist `batch/Job` (not Pod).
+- Self-heal (v3.2) fixed drift **without** running PreSync.
+
+---
+
+## Commands used most
+
+```bash
+# session
+k3d cluster start dev / stop dev
+kubectl port-forward svc/my-argo-cd-argocd-server -n argocd 8443:443
+argocd login localhost:8443 --insecure --username admin          # run alone
+
+# applications
+kubectl get app -n argocd
+argocd app get <app> [--refresh]
+argocd app diff <app>
+argocd app sync <app>
+argocd app history <app>
+argocd app delete <app> --yes                                     # cascades
+argocd app terminate-op <app>                                     # stop a stuck sync
+
+# why did the last sync do that?
+kubectl get app <app> -n argocd -o jsonpath='{.status.operationState.phase}{"\n"}{.status.operationState.message}{"\n"}'
+kubectl get app <app> -n argocd -o jsonpath='{range .status.operationState.syncResult.resources[*]}{.hookPhase}{"\t"}{.kind}/{.name}{"\t"}{.syncPhase}{"\n"}{end}'
+kubectl get app <app> -n argocd -o jsonpath='{.status.operationState.operation.initiatedBy}{"\n"}'
+
+# repos, projects, RBAC
+argocd repo list
+kubectl get secret -n argocd -l argocd.argoproj.io/secret-type=repository
+kubectl get appproj -n argocd
+argocd admin settings rbac can <user> <action> applications '<project>/<app>' --namespace argocd
+
+# hooks
+kubectl get pods -n <ns> -w                                       # -w takes ONE resource type
+kubectl logs -n <ns> job/<hook-job>
+```
+
+## Golden rules
+
+1. Git is the only way changes reach the cluster. Fix in Git, then let Argo CD apply it.
+2. Pin everything: chart versions, image tags (digests in prod), hook images.
+3. Least privilege everywhere: read-only deploy keys, scoped tokens, project guardrails, empty default RBAC.
+4. Secrets never go in Git, in URLs, in shell history or in chat.
+5. Predict before you run, then check: `git diff` before every commit, `rbac can` before every RBAC change.

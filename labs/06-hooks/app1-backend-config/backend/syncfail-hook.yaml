@@ -1,0 +1,25 @@
+# SyncFail hook: runs ONLY when a sync of app1-be-app fails.
+# Real life: post the failure to Slack/PagerDuty or save context. Here it just logs.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: syncfail-notify
+  annotations:
+    argocd.argoproj.io/hook: SyncFail
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    # only BeforeHookCreation: the Job is kept after it runs so you can read its logs,
+    # and is cleaned up just before the next SyncFail run
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: notify
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "SYNC FAILED for app1-be-app at $(date -u)"
+              echo "Real life: send an alert here (Slack webhook, PagerDuty, ...)"

@@ -1,0 +1,16 @@
+# Lecture 03, Lab 3B: the first Application. Manual sync (no syncPolicy).
+# The target namespace must exist first: kubectl create ns guestbook
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: guestbook                    # name INSIDE Argo CD
+  namespace: argocd                  # where Argo CD runs, not where the app runs
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/argoproj/argocd-example-apps.git
+    targetRevision: HEAD
+    path: guestbook
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: guestbook

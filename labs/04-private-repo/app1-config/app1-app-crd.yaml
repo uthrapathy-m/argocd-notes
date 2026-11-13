@@ -1,0 +1,18 @@
+# This file lives at the repo ROOT and the source path is "." so Argo CD also
+# renders THIS file: the Application ends up managing itself. That's why changes
+# to it must go through Git (see study notes §4 "self-managed Application").
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app1
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/<GITHUB_USER>/app1-config.git
+    targetRevision: HEAD
+    path: .
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: app1-ns
+  # Lab steps 4.10 to 4.12 add a syncPolicy block here, one feature at a time.

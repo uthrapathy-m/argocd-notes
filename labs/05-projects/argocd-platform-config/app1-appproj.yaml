@@ -1,0 +1,63 @@
+# Guardrails for everything app1 (frontend + backend). Owned by the platform team,
+# applied BEFORE any Application that references it. Lives in its own repo because
+# it governs the whole app1 boundary, not one tier.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: app1-project
+  namespace: argocd # Argo CD only reads AppProjects from its own namespace
+spec:
+  description: Project for App1 frontend and backend workloads
+
+  # WHERE manifests may come from. Must match the Application's repoURL exactly:
+  # these are SSH URLs because Argo CD reads the repos with deploy keys.
+  sourceRepos:
+    - git@github.com:<GITHUB_USER>/app1-frontend-config.git
+    - git@github.com:<GITHUB_USER>/app1-backend-config.git
+
+  # WHERE they may be deployed: this cluster, namespaces matching app1-*
+  destinations:
+    - namespace: app1-*
+      server: https://kubernetes.default.svc
+
+  # WHAT may be deployed. Cluster-scoped kinds are denied unless listed here.
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+
+  # Once this list exists, every namespaced kind NOT in it is denied (implicit deny).
+  namespaceResourceWhitelist:
+    - group: apps
+      kind: Deployment
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ConfigMap
+    - group: ""
+      kind: Secret
+
+  # Explicit hard deny. Redundant here (the whitelist already blocks them), but it
+  # documents intent and still holds if someone later widens the whitelist to "*".
+  clusterResourceBlacklist:
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+
+  # WHO may operate the apps (Argo CD RBAC, not Kubernetes RBAC).
+  # "groups" are matched against SSO group claims (module 13). Local accounts
+  # have no groups, so the lab grants the local test user access in argocd-rbac-cm.
+  roles:
+    - name: dev-readonly
+      description: Read-only access for developers
+      policies:
+        - p, proj:app1-project:dev-readonly, applications, get, app1-project/*, allow
+      groups:
+        - app1-devs
+
+    - name: platform-admin
+      description: Full control for platform team
+      policies:
+        - p, proj:app1-project:platform-admin, applications, *, app1-project/*, allow
+      groups:
+        - platform-team

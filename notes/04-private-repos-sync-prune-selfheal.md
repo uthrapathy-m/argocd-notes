@@ -1,0 +1,611 @@
+# 04 · Private Repos and Registries, Automated Sync, Pruning, Self-Healing
+
+> **Lab files:** [`labs/04-private-repo/`](../labs/04-private-repo): a Flask app with a **GitHub Actions** build workflow, and its config repo.
+>
+> **Lab needs:** local k3d + Argo CD ([00-lab-setup.md](00-lab-setup.md)) + GitHub + Docker Hub
+>
+> **Time:** ~1.5 h reading + ~2.5 h lab + 30 min revision. **The most important lecture of the basics.**
+
+---
+
+## TL;DR
+
+1. **In production everything is private:** Git repos, container images, credentials. The GitOps concepts don't change; you add authentication at each hop.
+2. **Two credentials, two consumers. Don't mix them up:**
+
+   | Hop | Who authenticates | Credential | Lives in |
+   |---|---|---|---|
+   | Argo CD → **private Git** (config repo only) | Argo CD **repo server** | PAT / **deploy key** / GitHub App (read-only) | Secret in `argocd` ns (`argocd repo add`) |
+   | Node → **private registry** (image pull) | **Container runtime** (kubelet/containerd) | Registry token (read-only) | `docker-registry` Secret in the **app's namespace**, referenced by `imagePullSecrets` |
+
+   **Argo CD never pulls images.** Kubernetes does.
+3. **Secret values can't go in Git**, so an imperatively created Secret breaks "Git = full desired state". The fix is **External Secrets + a secret manager** (module 11). Best of all: **cloud IAM** (IRSA/Pod Identity → ECR), where there's no secret at all.
+4. **Base64 ≠ encryption.** Lock `get/list/watch` on Secrets with RBAC. A user can create Deployments that *use* a pull secret without being able to *read* it.
+5. All three automation features are **off by default**, on purpose:
+   - **Automated sync**: apply Git changes without clicking Sync. *Git review becomes the approval gate.*
+   - **Prune**: delete live resources whose manifests were removed from Git.
+   - **Self-heal**: revert manual (`kubectl`) changes to live resources.
+
+   Prune and self-heal only work **inside automated sync**.
+6. Detection runs every **~3 min** (`timeout.reconciliation`) whether or not auto-sync is on. **Refresh** = re-compare now (never applies). **Hard refresh** = drop caches, re-render, then compare. **Sync** = apply.
+7. If the Application manifest lives in the path it syncs, the **Application manages itself**. Any change to it must be **committed to Git**, or Argo CD reverts it.
+8. **Automated sync runs once per new commit.** A commit that both *enables* prune and *deletes* a file won't prune until the next commit (or a manual sync).
+
+---
+
+## 1. Demo architecture
+
+```
+ ARTIFACT CREATION (pre-GitOps, steps 1–5)                GITOPS RECONCILIATION (steps 6–11)
+ ─────────────────────────────────────────                ─────────────────────────────────────────
+ 1 private repos: app1 (code) + app1-config (manifests)   6 ns app1-ns + docker-registry pull Secret
+ 2 Git credentials                                        7 Deployment (imagePullSecrets) + ClusterIP Service
+ 3 local folders (code vs config)                         8 Application CR (source = private config repo)
+ 4 private Docker Hub repo + read-only pull token         9 push both repos
+ 5 build + push image  ── you: GitHub Actions ──▶ Hub    10 give Argo CD read access to config repo
+                                                         11 refresh → OutOfSync → Sync → Healthy
+```
+
+**Argo CD needs access to the *config* repo only.** It never reads the app/code repo.
+
+---
+
+## 2. Credentials and secrets
+
+### 2.1 Git access for Argo CD: options from weakest to strongest
+
+| Option | Identity | Scope | Use it for |
+|---|---|---|---|
+| Personal Access Token (PAT) | **A human user** ("a user pretending to be a system") | Fine-grained PATs: chosen repos + permissions | Humans (devs, DevOps) pushing code: auditable per person |
+| Machine user + PAT (`gitops-bot`) | A user account dedicated to automation | Whatever the bot can see | Works, but it's still a user to license, rotate and offboard |
+| **Deploy key** (SSH) | **No identity**: bound **1:1 to a repo**, read-only by default | Exactly one repo | **Argo CD** reading config repos (10 repos = 10 keys) |
+| **GitHub App** | **A first-class system identity** | Installed on chosen repos; short-lived tokens | Orgs with many repos; CI systems |
+
+> A common demo shortcut is **one PAT (Contents: read/write) serving 3 actors**: developer, DevOps and Argo CD. **Argo CD only needs read.**
+
+### 2.2 Image pull: the `docker-registry` Secret
+
+```bash
+kubectl create secret docker-registry dockerhub-secret \
+  --docker-server=https://index.docker.io/v1/ \
+  --docker-username=<user> \
+  --docker-password=<READ-ONLY access token, not your password> \
+  --namespace=app1-ns
+```
+- `docker-registry` is the secret **type** (it should really be called "image registry"). It works for **any** registry: ECR, GHCR, GAR…
+- It must live **in the same namespace as the Pod**. The Deployment references it with `imagePullSecrets`.
+- The data sits in `.dockerconfigjson`, base64-encoded, so anyone who can `get` it can decode the token.
+- `--docker-email` is optional legacy metadata.
+
+### 2.3 Registry auth ladder
+
+| Level | Method | Verdict |
+|---|---|---|
+| 1 | Registry **password** in a pull Secret | ❌ Never: broad access, hard to rotate |
+| 2 | Scoped **access token** (read-only) in a pull Secret | Minimum baseline |
+| 3 | **External Secrets Operator + secret manager** (AWS Secrets Manager, Vault, Azure Key Vault) | **Production standard for third-party registries** (Docker Hub, GHCR): the manifest is in Git, the value isn't |
+| 4 | **Cloud-native IAM**: IRSA/Pod Identity or node role → **ECR** (GAR/ACR similar) | **Best**: no static secret at all. Only works with the cloud's own registry. |
+
+> 🧠 **Why imperative secrets "break GitOps":** Git no longer describes *everything* needed to run the app. Rebuild the cluster from Git and the pod sits in `ImagePullBackOff` until someone remembers to create the Secret by hand. External Secrets put the **reference** in Git and keep the **value** in the vault.
+
+---
+
+## 3. The three sync automation features
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/sync-features-dark.svg">
+  <img src="../images/sync-features-light.svg" alt="Automated sync, prune and self-heal" width="760">
+</picture>
+
+*Each feature reacts to a different event.*
+
+| | **Automated sync** | **Prune** | **Self-heal** |
+|---|---|---|---|
+| YAML | `syncPolicy.automated: {}` | `automated.prune: true` | `automated.selfHeal: true` |
+| Reacts to | A **new Git commit** that makes the app OutOfSync | A resource **removed from Git** but still live | A **live** resource changed by hand (kubectl, console) |
+| Action | Applies Git | **Deletes** the orphaned live resource | Re-applies Git over the drift |
+| Default off because | Prevents unreviewed rollouts during early adoption | Prevents mass deletion from a bad or partial commit | Lets engineers debug or patch live during incidents |
+| Use when | Git PR review is trusted, so *code review is the real approval gate*. Auto-sync **amplifies good and bad Git habits**. | Git models **existence** (lifecycle), not just config | Manual changes are forbidden: "the cluster is read-only at runtime" |
+
+### Timing: refresh vs sync
+
+| Action | What it does |
+|---|---|
+| **Reconciliation loop** (every `timeout.reconciliation`, default **180s** in this chart) | Polls Git, recomputes desired state, compares with live, updates sync status. **Applies nothing unless automated sync is on.** |
+| **Refresh** (UI button / `argocd app get --refresh`) | Do the comparison *now*. **Never applies.** |
+| **Hard refresh** | Drop the manifest cache, re-render from Git, then compare (use after changing Helm values or plugins, or when the cache looks stale) |
+| **Sync** | Apply desired state to the cluster |
+| **Live changes** | Argo CD **watches** cluster resources, so manual edits are noticed within seconds. With self-heal, the revert happens almost immediately (after a short backoff), not after 3 minutes. |
+
+> 📌 **Auto-sync is event-driven, not a timer.** A commit made just after a poll waits for the next poll (or a Refresh, or a Git **webhook**).
+
+### The "one auto-sync per commit" rule (the pruning surprise)
+
+**The surprise (you reproduce it in lab 4.11):** one commit both deletes `app1-svc.yaml` **and** adds `prune: true`. The Service is **not** pruned. The next commit (any change) prunes it.
+
+**Why:**
+1. The sync for that commit started with the **live** Application spec, where `prune` was still `false`, and **sync options are fixed at the start of a sync**. That sync applied the new Application spec (now `prune: true`) but couldn't prune.
+2. **Automated sync only runs once per commit SHA.** The app stayed OutOfSync (an extra Service), but auto-sync wouldn't retry the same commit.
+3. The next commit gave it a new SHA → a new auto-sync, now with `prune: true` → the Service was deleted.
+
+(It's tempting to blame a forgotten `kubectl apply`. The real mechanism is the two rules above. A **manual Sync with "Prune" ticked** would also have removed it.)
+
+**Rule:** change *behaviour* (sync policy) in one commit, and make *destructive* changes in a later one.
+
+---
+
+## 4. The self-managed Application (a hidden twist)
+
+This lab puts `app1-app-crd.yaml` **in the root of the config repo**, and the Application uses `path: .`. So Argo CD renders **its own Application manifest** as one of app1's resources. **The Application manages itself.**
+
+Consequences:
+
+| You do | What happens |
+|---|---|
+| `kubectl apply` a change to the Application without committing it | Next sync (or self-heal) puts back the **Git** version. If you change Argo CD behaviour but don't commit it, Argo CD undoes your change. |
+| Commit + push the change | It takes effect on the next sync. You don't need `kubectl apply` (except the very first time, before auto-sync exists). |
+| Look at the UI tree | You'll see an **`Application` node (app1) inside app1**. |
+
+This works and teaches "even Argo CD's config lives in Git", but it's a slightly odd loop. The clean production version is **App of Apps** (lecture 09): a *parent* Application manages *child* Applications, never itself.
+
+---
+
+## 5. Hands-on lab (local k3d + GitHub + Docker Hub)
+
+> Replace `<GITHUB_USER>` and `<DOCKERHUB_USER>` with your accounts (the repo README has a one-line `sed`). If an output doesn't match **Expect**, check the troubleshooting table at the end of this section.
+
+### 4.0 Session start
+[00-lab-setup.md section 5](00-lab-setup.md#5-session-routine-every-lab): `k3d cluster start dev` → UI port-forward to 8443 (terminal 1) → `argocd login localhost:8443 --insecure --username admin` (terminal 2, run alone). Then `cd <this repo> && export NOTES=$PWD`. Check Git credentials ([00-lab-setup.md section 2.2](00-lab-setup.md#22-git-identity-and-credentials)): `git config --show-origin --get-all credential.helper` should show a credential manager.
+
+### 4.1 Create two private GitHub repos
+GitHub → **New repository**:
+- `app1`: **Private**, no README (we push an existing folder)
+- `app1-config`: **Private**, no README
+
+**Why two:** devs own *what the app is*; platform owns *how it runs*. Argo CD gets access to `app1-config` only.
+
+### 4.2 Docker Hub: private repo + **two** tokens
+1. Docker Hub → **Create repository** → name `app1` → **Private**.
+2. Account settings → **Personal access tokens** → create:
+   - `gha-push`: **Read & Write**. Only GitHub Actions will use it.
+   - `k8s-pull`: **Read-only**. Only the cluster will use it.
+
+Save both somewhere safe (a password manager, **not** a file in this repo). Docker Hub shows each token once.
+
+> 🧠 **Neither** consumer ever sees the account password, and each token has the **least privilege** for its job. Pick **Read-only**, not "Public Repo Read-only": the cluster must pull a **private** repo, and the public-only token fails with `insufficient_scope`.
+
+### 4.3 Copy the lab files out of this repo
+```bash
+mkdir -p ~/gitops && cp -r "$NOTES/labs/04-private-repo/app1" "$NOTES/labs/04-private-repo/app1-config" ~/gitops/
+ls -la ~/gitops/app1 ~/gitops/app1-config ~/gitops/app1/.github/workflows
+GH_USER=your-github-user; DH_USER=your-dockerhub-user          # your real account names
+sed -i -e "s/<GITHUB_USER>/$GH_USER/g" -e "s/<DOCKERHUB_USER>/$DH_USER/g" ~/gitops/app1-config/*.yaml
+```
+Then check the two values (`code ~/gitops`):
+- `app1-config/app1-deploy.yaml` → `image: <DOCKERHUB_USER>/app1:v1.0.0` (Docker Hub user `<DOCKERHUB_USER>`)
+- `app1-config/app1-app-crd.yaml` → `repoURL: https://github.com/<GITHUB_USER>/app1-config.git` (GitHub user `<GITHUB_USER>`)
+
+⚠️ They're different: GitHub has a **hyphen**, Docker Hub doesn't. Mixing them up is the #1 cause of `repository not found` or `ImagePullBackOff` in this lab.
+
+**Why outside this notes repo:** each will become its own Git repo, and nesting repos inside another one gets confusing.
+
+### 4.4 App repo: CI builds the image
+GitHub → `app1` → **Settings → Secrets and variables → Actions**:
+- **Variables** tab → `DOCKERHUB_USERNAME` = your Docker Hub username. It isn't secret; a variable keeps it readable in logs.
+- **Secrets** tab → `DOCKERHUB_TOKEN` = the `gha-push` token.
+
+Read [`build-push.yml`](../labs/04-private-repo/app1/.github/workflows/build-push.yml) first:
+
+| Step | Why |
+|---|---|
+| `on: push: tags: v*.*.*` | Building on a **version tag** = one immutable image per release |
+| `permissions: contents: read` | The workflow token can only read the repo (least privilege) |
+| `docker/login-action` with `secrets.DOCKERHUB_TOKEN` | The secret is injected at runtime, masked in logs, never in Git |
+| `metadata-action` tags | `v1.0.0` (from the Git tag) + `sha-<commit>` (traceable back to the exact code) |
+| `flavor: latest=false` | metadata-action adds a mutable `latest` tag on tag pushes by default. Turn it off: nothing should deploy "latest". |
+| Summary step | Prints the **digest** (`sha256:…`): the truly immutable reference from lecture 01 |
+
+```bash
+cd ~/gitops/app1
+git init -b main
+git add .
+git commit -m "app1: flask app, Dockerfile, CI workflow"
+git remote add origin https://github.com/<GITHUB_USER>/app1.git
+git push -u origin main
+```
+- **Auth:** Git Credential Manager opens a browser on the first push and stores the credential in the OS credential store.
+- ⚠️ **Don't** use `git remote set-url origin https://<PAT>@github.com/...`. That writes your token **in plain text** into `.git/config`.
+- **Using `gh`?** Set the CI values without the web UI: `gh variable set DOCKERHUB_USERNAME --body "<DOCKERHUB_USER>" --repo <GITHUB_USER>/app1` and `gh secret set DOCKERHUB_TOKEN --repo <GITHUB_USER>/app1` (prompts for the value; run it alone).
+
+```bash
+# Optional, now that you have Docker: test the image locally before releasing
+#   docker build -t app1:local . && docker run --rm -p 5000:5000 app1:local   → curl localhost:5000, Ctrl+C
+git tag v1.0.0
+git push origin v1.0.0
+```
+- **Expect:** GitHub → `app1` → **Actions** → `build-and-push` goes green in about 1–2 minutes. Open the run → **Summary** shows the tags and the `sha256:` digest. Docker Hub → `app1` → tags `v1.0.0` and `sha-xxxxxxx`.
+- **Why the tag push triggers the build:** pushing to `main` builds nothing; *releasing* (tagging) does. That's a common pattern.
+
+### 4.5 Namespace + image pull Secret (imperative, on purpose)
+```bash
+kubectl create ns app1-ns
+read -rs DH_TOKEN            # paste the k8s-pull token, press Enter (nothing is shown, nothing lands in history)
+kubectl create secret docker-registry dockerhub-secret \
+  --docker-server=https://index.docker.io/v1/ \
+  --docker-username=<DOCKERHUB_USER> \
+  --docker-password="$DH_TOKEN" \
+  --namespace=app1-ns
+unset DH_TOKEN
+```
+Now prove the "base64 ≠ encryption" point:
+```bash
+kubectl get secret dockerhub-secret -n app1-ns -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d; echo
+```
+- **Expect:** JSON with your username and token in clear text. That's why `get secrets` RBAC must be tight.
+
+- Had you typed the token on the command line, it would also sit in your shell history. `read -rs` avoids that, but the Secret still lives only in the cluster: one more reason imperative secrets are a stopgap.
+
+### 4.6 Config repo: push it
+```bash
+cd ~/gitops/app1-config
+git init -b main
+git add .
+git commit -m "app1-config: deployment, service, Argo CD Application"
+git remote add origin https://github.com/<GITHUB_USER>/app1-config.git
+git push -u origin main
+```
+
+### 4.7 Create the Application, expecting a failure
+```bash
+kubectl apply -f app1-app-crd.yaml
+kubectl get app app1 -n argocd
+```
+- **Expect:** Sync status **Unknown** with a ComparisonError. In the UI: `Failed to load target state … authentication required`.
+- **Why:** the repo server tried to clone a **private** repo with no credentials. Nothing is wrong with the manifests.
+
+### 4.8 Give Argo CD **read-only** access to the config repo
+Create a **fine-grained PAT** just for Argo CD: GitHub → Settings → Developer settings → Fine-grained tokens:
+- Name `argocd-app1-config-read`, expiry 30 days
+- Repository access: **Only select repositories → `app1-config`**
+- Permissions: **Contents: Read-only** (Metadata: read-only is added automatically)
+
+Connect it in the UI (**Settings → Repositories → + CONNECT REPO → VIA HTTPS**: URL, username, the PAT as password), or with the CLI. The CLI prompts for the password when you leave `--password` out, so the token never lands in shell history:
+```bash
+argocd repo add https://github.com/<GITHUB_USER>/app1-config.git \
+  --name app1-config \
+  --username <GITHUB_USER>
+argocd repo list
+```
+- **Expect:** `STATUS: Successful`.
+- **`Write access to repository not granted` / `authentication required`?** Test the token directly against GitHub before blaming Argo CD: `curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $TOKEN" https://api.github.com/repos/<GITHUB_USER>/app1-config/contents` (with the token in `$TOKEN` via `read -rs TOKEN`). `403 Resource not accessible by personal access token` = the PAT is missing **Contents: Read-only**.
+- **What happened under the hood:**
+  ```bash
+  kubectl get secret -n argocd -l argocd.argoproj.io/secret-type=repository
+  kubectl get secret -n argocd -l argocd.argoproj.io/secret-type=repository -o yaml | head -30
+  ```
+  `argocd repo add` just created a **Kubernetes Secret with a special label**. The repo server finds it by that label. *That's how you'd manage repo credentials declaratively later* (with External Secrets producing that labelled Secret).
+
+### 4.9 Refresh → OutOfSync → Sync → Healthy
+UI → `app1` → **Refresh** → **OutOfSync / Missing** → **Sync → Synchronize**.
+```bash
+kubectl get pods,svc -n app1-ns
+kubectl describe pod -n app1-ns -l app=app1 | grep -A3 -i "pulled\|image"
+```
+- **Expect:** pod `Running`, and an event like `Successfully pulled image "<you>/app1:v1.0.0"`. That's the **container runtime** using `dockerhub-secret`, not Argo CD.
+- If you see **ImagePullBackOff**: `kubectl describe pod` → usually a wrong secret name or namespace, a token typo, the wrong token scope (`insufficient_scope`), or the image name doesn't match the Docker Hub repo.
+- **Test the pull token directly** (bypasses Kubernetes): get a registry token with `curl -s -u "<DOCKERHUB_USER>:$DH_TOKEN" "https://auth.docker.io/token?service=registry.docker.io&scope=repository:<DOCKERHUB_USER>/app1:pull"`, then `HEAD` the manifest at `https://registry-1.docker.io/v2/<DOCKERHUB_USER>/app1/manifests/v1.0.0` with it. `200` = the token works; `401` = wrong scope or token. After fixing, recreate the Secret and delete the pod.
+
+```bash
+# terminal 4
+kubectl port-forward -n app1-ns svc/app1-svc 8081:80
+curl -s localhost:8081     # or open http://localhost:8081
+```
+- **Expect:** `{"context":"GitOps-managed Flask application", …}`
+
+🔍 **Observe the self-managed Application:** in the UI tree of `app1`, find an **Application** node named `app1`. Read section 4 again: this is why the next steps go through Git.
+
+### 4.10 Automated sync
+Edit **two** files in `~/gitops/app1-config`:
+- `app1-deploy.yaml`: `replicas: 1` → `replicas: 2`
+- `app1-app-crd.yaml`: add at the end of `spec:`
+  ```yaml
+    syncPolicy:
+      automated: {}
+  ```
+
+```bash
+git add . && git commit -m "app1: 2 replicas; enable automated sync" && git push
+```
+Now UI → **Refresh** → **Sync** (one manual sync, the last one you'll need).
+- **Why one manual sync:** auto-sync doesn't exist yet in the *live* Application. This sync applies the new Application spec, which turns auto-sync on, plus the replica change.
+- **Why Git first, then sync/apply:** with a self-managed app, a `kubectl apply` of an *uncommitted* spec gets reverted by the next sync.
+
+```bash
+kubectl get app app1 -n argocd -o jsonpath='{.spec.syncPolicy}'; echo   # {"automated":{}}
+kubectl get pods -n app1-ns                                              # 2 pods
+```
+
+**Test it:** change `replicas: 2` → `3`, commit, push, **don't touch the UI**. Run `kubectl get pods -n app1-ns -w`.
+- **Saved the file?** If `git status` says `nothing to commit`, your editor hasn't written the change to disk. Auto-sync can't enable itself from an unsaved buffer.
+- **Expect:** a third pod appears within about 3 minutes (or immediately if you click Refresh, which re-compares; auto-sync then applies).
+- Check the poll interval yourself:
+  ```bash
+  kubectl -n argocd get cm argocd-cm -o yaml | grep -i reconciliation
+  ```
+
+### 4.11 Pruning: reproduce the surprise (predict first!)
+In **one** commit:
+- `git rm app1-svc.yaml` (the ClusterIP Service is "replaced by Ingress" in the story)
+- `app1-app-crd.yaml`: `automated: {}` →
+  ```yaml
+      automated:
+        prune: true
+  ```
+```bash
+git add -A && git commit -m "remove ClusterIP svc; enable prune" && git push
+```
+UI → Refresh. Wait for the sync. **Is `app1-svc` gone?**
+```bash
+kubectl get svc -n app1-ns
+kubectl get app app1 -n argocd -o jsonpath='{.spec.syncPolicy}'; echo
+```
+<details><summary>Expected result and explanation</summary>
+
+The Service **still exists**. The app shows **OutOfSync** (app1-svc marked *requires pruning*), and the live spec **does** have `prune: true`. That's the "one auto-sync per commit" rule plus sync options being fixed at sync start (section 3). The sync for this commit started while prune was still false.
+</details>
+
+Now make any new commit (e.g. `replicas: 2`), push, Refresh:
+```bash
+kubectl get svc -n app1-ns     # → No resources found
+```
+✅ Pruned. (The port-forward in terminal 4 dies, which is expected: its Service is gone.)
+
+### 4.12 Self-healing
+`app1-app-crd.yaml` →
+```yaml
+    automated:
+      prune: true
+      selfHeal: true
+```
+Commit + push + Refresh. Confirm: UI → app1 → **Details** → *Self Heal* enabled.
+
+Now drift on purpose:
+```bash
+kubectl scale deploy app1 -n app1-ns --replicas=1
+kubectl get pods -n app1-ns -w
+```
+- **Expect:** pods terminate, then come straight back to the Git count **within seconds**. Argo CD *watches* live objects; it doesn't wait for the 3-minute poll.
+- Compare with lecture 03 Lab 3E: same command, but there the change **stuck**. The difference is `selfHeal`.
+
+**The GitOps-pitfall demo** (key takeaway):
+```bash
+kubectl patch app app1 -n argocd --type merge -p '{"spec":{"syncPolicy":{"automated":{"prune":false}}}}'
+kubectl get app app1 -n argocd -o jsonpath='{.spec.syncPolicy}'; echo     # run again after ~10s
+```
+- **Expect:** `prune` flips back to `true`. The Application is self-managed and self-healing, so **even Argo CD's own config is enforced from Git**.
+- **Why patch `prune` and not `selfHeal`?** If you patched `selfHeal: false`, you'd switch off the very feature that does the reverting. The live spec is what's in force, so nothing would flip back until the next commit. Try it afterwards as a bonus prediction exercise.
+
+### 4.13 (Extra) Ship a new version end to end: the manual handoff
+1. `~/gitops/app1/app.py`: change `message=` to something new.
+   `git commit -am "new message" && git push && git tag v1.1.0 && git push origin v1.1.0`
+2. Wait for Actions to go green. Copy the **digest** from the run summary.
+3. `~/gitops/app1-config/app1-deploy.yaml`: `image: <DOCKERHUB_USER>/app1:v1.1.0`. Or, production-style:
+   `image: <DOCKERHUB_USER>/app1@sha256:<digest>`
+4. Commit, push, and watch Argo CD roll it out (`kubectl get pods -n app1-ns -w`). Port-forward to the Deployment and curl:
+   `kubectl port-forward -n app1-ns deploy/app1 8081:5000` → `curl localhost:8081`
+
+You just did by hand the **handoff** from lecture 01: CI publishes the artifact, a human (later a bot) updates the config repo, Argo CD pulls it. Module 14 automates step 3.
+
+### 4.14 (Extra) Replace the PAT with an SSH **deploy key** (production habit)
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/argocd-app1-config -N "" -C "argocd@k3d-dev"
+cat ~/.ssh/argocd-app1-config.pub
+```
+GitHub → `app1-config` → **Settings → Deploy keys → Add deploy key** → paste the **.pub** → leave *Allow write access* **unticked** (or `gh repo deploy-key add ~/.ssh/argocd-app1-config.pub --repo <GITHUB_USER>/app1-config --title "argocd"`, read-only by default).
+
+Connect it: UI → **Settings → Repositories → + CONNECT REPO → VIA SSH**, URL `git@github.com:<GITHUB_USER>/app1-config.git`, paste the **private** key (`clip < ~/.ssh/argocd-app1-config` on Windows copies it without printing it; clear the clipboard afterwards with `echo -n | clip`). CLI alternative:
+```bash
+argocd repo add git@github.com:<GITHUB_USER>/app1-config.git \
+  --name app1-config-ssh \
+  --ssh-private-key-path ~/.ssh/argocd-app1-config
+argocd repo list
+```
+Change `repoURL` in `app1-app-crd.yaml` to `git@github.com:<GITHUB_USER>/app1-config.git`, commit, push (your own push still goes over HTTPS through the `origin` remote), Refresh.
+
+Once the app is Synced through SSH, remove the PAT-based repo and revoke the PAT on GitHub:
+```bash
+argocd repo rm https://github.com/<GITHUB_USER>/app1-config.git
+```
+- **Why better:** the key is bound to **one repo**, is **read-only**, and belongs to **no human**. Offboarding an engineer can't break Argo CD.
+- **Deploy key vs fine-grained PAT (both scoped to one repo):** the PAT belongs to a **person**. That person can widen its scope or permissions later, it dies with their account, and it acts as them. The deploy key **is** the repo's: it can never reach another repo and isn't tied to anyone's account.
+- Argo CD ships GitHub's SSH host keys (`argocd-ssh-known-hosts-cm`), so no known_hosts setup is needed.
+
+### Troubleshooting (all seen in real runs)
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `argocd repo add` → `Write access to repository not granted` | The PAT has only Metadata permission | Add **Contents: Read-only** to the fine-grained PAT |
+| Pods `ImagePullBackOff`, events say `insufficient_scope` | Pull token is "Public Repo Read-only" | New **Read-only** token, recreate `dockerhub-secret`, delete the pod |
+| Auto-sync never turns on | The edited Application file was never saved / committed | `git status`, save, commit, push, one manual sync |
+| Docker Hub shows an unexpected `latest` tag | metadata-action default | `flavor: latest=false` in the workflow |
+| A merge commit appears on every push | Pulling with merge | `git pull --rebase` |
+| Deleting `app1` hangs (`OutOfSync Missing`, `deletionTimestamp` set) | The self-managed app has the foreground finalizer and waits for itself | Check nothing is left (`kubectl get all -n app1-ns`), then remove the finalizer: `kubectl patch app app1 -n argocd --type json -p '[{"op":"remove","path":"/metadata/finalizers"}]'` |
+
+### End of session
+Keep app1 running if you like. Lecture 05 retires it first. Then:
+```bash
+k3d cluster stop dev      # Ctrl+C port-forwards first
+```
+
+---
+
+## 6. Production reality and pitfalls
+
+### Common claims and shortcuts, with nuance
+
+| Common claim or shortcut | Nuance |
+|---|---|
+| `git remote set-url origin https://<PAT>@github.com/…` | Stores the token **in plain text** in `.git/config` (and it's easy to paste into screenshots). Use **Git Credential Manager** or SSH keys. |
+| Push images with the Docker Hub account password | Use a **scoped read/write token** for CI, never the account password |
+| "I forgot to kubectl apply, that's why prune didn't run" | The real cause is **one auto-sync per commit + options fixed at sync start** (section 3). A manual sync with Prune would have worked immediately. |
+| `kubectl apply` the Application, *then* push | With a self-managed Application, **push first**. An uncommitted live change can be reverted. |
+| "Self-heal was instant because the information was cached" | It's instant because the controller **watches** live resources (Kubernetes informers), so a change event triggers comparison immediately, followed by a short self-heal backoff. The 3-minute poll is only for **Git**. |
+| "Argo CD reconciles every 3 minutes" | Default `timeout.reconciliation` is 180s in this chart (newer Argo CD defaults add **jitter** to spread load). Check `argocd-cm` on your install. **Git webhooks** make it near-instant. |
+| `--docker-email` "required" | Optional legacy field |
+
+### What changes in real companies
+
+- **Repo credentials at scale:** use a **credential template** (`argocd.argoproj.io/secret-type: repo-creds`) with a URL prefix like `https://github.com/my-org/` so every repo under the org reuses one credential (best with a **GitHub App**). Manage these Secrets with **External Secrets**, not `argocd repo add`.
+- **Webhooks:** GitHub → `https://argocd.example.com/api/webhook` on push. Near-instant sync, and less polling load (API rate limits!). Needs a reachable Argo CD endpoint, which we'll have once we add Ingress.
+- **Image pull without secrets:** on EKS with **ECR**, nodes or pods authenticate through IAM. No `imagePullSecrets` at all. That's the capstone setup.
+- **Auto-sync guardrails:**
+  - `automated.allowEmpty: false` (default): auto-sync won't prune *everything* if a bad commit empties the path.
+  - `syncPolicy.retry` with backoff for transient failures.
+  - `syncOptions: [PruneLast=true]` deletes old resources only after new ones are healthy.
+  - `argocd.argoproj.io/sync-options: Prune=false` on precious resources.
+- **Rollback with auto-sync on:** Argo CD **refuses UI/CLI rollback** while automated sync is enabled, because it would immediately re-sync to Git. Rollback = **`git revert`** (lecture 01).
+- **Self-heal vs other controllers (classic gotcha):** if an **HPA** scales the Deployment while Git says `replicas: 2`, self-heal and the HPA **fight**. Fix: remove `replicas` from the manifest when using an HPA, or add `ignoreDifferences` for `/spec/replicas`. The same applies to operators that mutate their own resources.
+- **Incident break-glass:** disable self-heal for one app (by a reviewed commit, or a documented emergency override), debug, then commit the fix and re-enable.
+
+### Stateful lens
+
+| Feature | Stateful risk | Guard rail |
+|---|---|---|
+| **Prune** | Removing a PVC manifest from Git deletes the PVC → **data loss** (depending on reclaim policy) | Annotate PVCs `argocd.argoproj.io/sync-options: Prune=false`; StorageClass `reclaimPolicy: Retain` for critical data |
+| **Prune** | StatefulSet `volumeClaimTemplates` PVCs are created by the StatefulSet controller, not Argo CD | They're **not tracked**, so not pruned, and not deleted with the app either. Clean them up deliberately. |
+| **Self-heal** | DB operators (e.g. CloudNativePG, RabbitMQ operator) mutate their own CRs → endless fight | `ignoreDifferences` on operator-managed fields |
+| **Auto-sync** | A schema-breaking image ships the moment it's merged | PreSync migration hooks (lecture 06), backward-compatible migrations, progressive delivery (module 15) |
+| **Secrets** | RDS password in an imperative Secret disappears when the cluster is rebuilt | ESO + Secrets Manager (module 11), with Terraform writing the value |
+
+### Common mistakes
+
+1. Giving Argo CD a **read/write** token. It only ever reads.
+2. Creating the pull Secret in `argocd` instead of the **app's namespace** → `ImagePullBackOff`.
+3. Enabling prune and self-heal on day one of a migration, before Git is trusted → surprise deletions and reverted hotfixes.
+4. Editing the Application with `kubectl` when it's managed from Git → "my change disappeared".
+5. Using `:latest`. Auto-sync can't see a change in Git, so nothing rolls out, *and* you can't tell what's running.
+
+---
+
+## 7. Revision kit
+
+### Command cheat sheet
+
+| Command | Purpose |
+|---|---|
+| `kubectl create secret docker-registry <name> --docker-server … --docker-username … --docker-password <token> -n <app-ns>` | Image pull Secret |
+| `kubectl get secret <name> -n <ns> -o jsonpath='{.data.\.dockerconfigjson}' \| base64 -d` | Prove base64 ≠ encryption |
+| `argocd repo add <https-url> --username … --password <PAT>` | Repo access over HTTPS |
+| `argocd repo add <git@…> --ssh-private-key-path <key>` | Repo access with a deploy key |
+| `argocd repo list` / `argocd repo rm <url>` | Inspect / remove |
+| `kubectl get secret -n argocd -l argocd.argoproj.io/secret-type=repository` | Where repo creds live |
+| `argocd app get <app> --refresh` / `--hard-refresh` | Re-compare / re-render then compare |
+| `kubectl -n argocd get cm argocd-cm -o yaml \| grep reconciliation` | Poll interval |
+| `git tag vX.Y.Z && git push origin vX.Y.Z` | Trigger the image build |
+
+### `syncPolicy` reference
+
+```yaml
+spec:
+  syncPolicy:
+    automated:            # presence = automated sync ON
+      prune: true         # delete live resources removed from Git
+      selfHeal: true      # revert manual live changes
+      # allowEmpty: false # (default) never auto-prune down to zero resources
+    syncOptions:
+      - CreateNamespace=true
+    # retry: { limit: 5, backoff: { duration: 5s, factor: 2, maxDuration: 3m } }
+```
+
+### Self-test
+
+<details><summary><b>Q1.</b> Which Argo CD component needs Git credentials, and for which repo?</summary>
+
+The **repo server**, for the **config** repo only. Argo CD never reads the app/code repo.
+</details>
+
+<details><summary><b>Q2.</b> Who pulls the private image, and where must the pull Secret live?</summary>
+
+The **container runtime** on the node (kubelet → containerd), using the Secret referenced by `imagePullSecrets`. It must be in the **same namespace as the Pod**. Argo CD isn't involved.
+</details>
+
+<details><summary><b>Q3.</b> Order these from weakest to strongest: deploy key, PAT, GitHub App, password.</summary>
+
+Password → PAT (user identity) → deploy key (repo-bound, no identity) ≈ GitHub App (first-class system identity, short-lived tokens; best at org scale).
+</details>
+
+<details><summary><b>Q4.</b> Why does an imperatively created Secret "break GitOps", and what fixes it?</summary>
+
+Git no longer contains everything needed to run the app, so rebuilding from Git fails until someone recreates the Secret by hand. The fix is External Secrets Operator + a secret manager (the reference in Git, the value in the vault), or cloud IAM with no secret at all.
+</details>
+
+<details><summary><b>Q5.</b> A user may create Deployments that use <code>dockerhub-secret</code>. Do they need <code>get</code> on secrets?</summary>
+
+No. The kubelet reads the Secret to pull the image; the user only references it by name. Keep secret `get/list/watch` tightly scoped.
+</details>
+
+<details><summary><b>Q6.</b> Refresh vs hard refresh vs sync?</summary>
+
+Refresh = compare Git with live now (never applies). Hard refresh = drop the manifest cache, re-render, then compare. Sync = apply desired state.
+</details>
+
+<details><summary><b>Q7.</b> Auto-sync on, self-heal off. Someone runs <code>kubectl scale</code>. What happens?</summary>
+
+The app goes OutOfSync but **nothing reverts it**. Auto-sync triggers on new Git commits, not on live drift. The drift is overwritten at the next sync caused by a new commit (or a manual sync).
+</details>
+
+<details><summary><b>Q8.</b> One commit deletes a manifest and enables prune. Why isn't the resource deleted, and how do you fix it?</summary>
+
+The sync started with the old live spec (prune=false), and options are fixed at sync start. Auto-sync then won't retry the same commit SHA. Fix: a manual sync with prune, or the next commit. Best practice: enable behaviour in one commit, make destructive changes in a later one.
+</details>
+
+<details><summary><b>Q9.</b> Why does <code>kubectl patch</code> on the app1 Application get reverted?</summary>
+
+Its manifest is inside the synced path (`path: .`), so app1 manages its own Application object. With self-heal on, live changes to it are reverted to the Git version.
+</details>
+
+<details><summary><b>Q10.</b> Why can't you click "Rollback" in the UI with auto-sync enabled, and what do you do instead?</summary>
+
+Argo CD blocks it because auto-sync would immediately re-apply Git HEAD. Roll back with `git revert`, which Argo CD then syncs.
+</details>
+
+<details><summary><b>Q11.</b> HPA + self-heal + <code>replicas: 2</code> in Git. What goes wrong?</summary>
+
+The HPA scales to N, self-heal resets to 2, and the two keep fighting. Remove `replicas` from Git, or `ignoreDifferences` on `/spec/replicas`.
+</details>
+
+### Interview questions
+
+<details><summary><b>I1.</b> "How does Argo CD access private repos securely at scale?"</summary>
+
+Read-only credentials only. Per-repo SSH deploy keys, or a GitHub App with a credential template (`repo-creds`) matching the org URL prefix. Credentials are stored as labelled Secrets in the Argo CD namespace, ideally delivered by External Secrets from a vault rather than created by hand. Never a human's PAT. Webhooks for fast detection.
+</details>
+
+<details><summary><b>I2.</b> "Should we turn on prune and self-heal in production?"</summary>
+
+Usually yes for mature apps, because they make Git authoritative and stop drift. But only once PR review is solid. Add guardrails: `allowEmpty: false`, `Prune=false` on PVCs and other precious objects, `ignoreDifferences` for fields other controllers own (HPA replicas, operator status), retry and backoff, a break-glass procedure for incidents, and notifications on sync failures. Roll them out per app, not globally.
+</details>
+
+<details><summary><b>I3.</b> "Walk me through deploying a new version in your GitOps setup."</summary>
+
+Merge to the app repo → tag → CI builds, tests, scans, pushes the image (digest recorded) → CI (or Image Updater) opens a PR in the config repo bumping the tag or digest → review and merge → a webhook or poll makes Argo CD detect OutOfSync → auto-sync applies → health checks go green. Rollback = revert the config PR.
+</details>
+
+<details><summary><b>I4.</b> "Pods are in ImagePullBackOff after Argo CD synced successfully. Why does Argo CD say Synced?"</summary>
+
+Sync only means the manifests were applied. Pulling the image is the kubelet's job: health becomes Degraded/Progressing while sync stays Synced. Check `kubectl describe pod` events. Usual causes: a missing or wrong pull Secret in that namespace, a wrong image name or tag, an expired token, registry rate limits.
+</details>
+
+<details><summary><b>I5.</b> "How do you handle the database password for an app deployed by Argo CD?"</summary>
+
+Never in Git. Terraform (or the DB platform) generates it into a secret manager (AWS Secrets Manager, with rotation). The app's config repo contains an `ExternalSecret` referencing it; ESO materialises a Kubernetes Secret that the pod consumes. RBAC limits who can read Secrets. On AWS, ESO authenticates with IRSA/Pod Identity, so there's no static credential anywhere.
+</details>
+
+---
+
+## 8. Before lecture 05
+
+- [ ] Labs 4.1–4.12 done (4.13 and 4.14 strongly recommended)
+- [ ] You can explain the pruning surprise (Q8) and the self-managed Application (Q9) without notes
+- [ ] Keep `app1` running if you can. Lecture 05 (AppProjects) restricts apps like it.
+- [ ] Cluster stopped (`k3d cluster stop dev`)

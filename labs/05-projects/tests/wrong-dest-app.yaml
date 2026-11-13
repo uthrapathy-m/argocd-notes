@@ -1,0 +1,17 @@
+# Test 3: an allowed repo, but a namespace outside app1-*.
+# Expect: InvalidSpecError "application destination ... namespace default ... is not permitted in project 'app1-project'".
+# Nothing is deployed. Apply it by hand, observe, then delete it.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app1-wrong-dest
+  namespace: argocd
+spec:
+  project: app1-project
+  source:
+    repoURL: git@github.com:<GITHUB_USER>/app1-backend-config.git
+    targetRevision: HEAD
+    path: backend
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
