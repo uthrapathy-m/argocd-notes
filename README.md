@@ -93,7 +93,7 @@ Full setup: [notes/00-lab-setup.md](notes/00-lab-setup.md).
 
 ## HTML pages
 
-`docs/` holds a styled page per note (sidebar contents, hand-drawn diagrams, copy buttons, light/dark, print to A4). Open them directly in a browser, or publish them with **GitHub Pages** (Settings → Pages → Branch `main`, folder `/docs`).
+`docs/` holds a styled page per note (sidebar contents, hand-drawn diagrams, copy buttons, light/dark, print to A4). Open them directly in a browser, or publish them with **GitHub Pages** (Settings → Pages → Source *Deploy from a branch* → `main` + `/docs`). `docs/` is self-contained: the build copies the diagrams in and points lab links at this GitHub repo (taken from `git remote get-url origin`).
 
 After editing any Markdown, regenerate them (Node 18+, no npm install needed):
 ```bash

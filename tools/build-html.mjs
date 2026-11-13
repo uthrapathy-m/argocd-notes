@@ -4,13 +4,26 @@
 // Each page embeds its Markdown and renders it in the browser (marked + Prism from CDNs),
 // so the HTML never drifts from the Markdown. Edit the .md files, then re-run this script.
 
-import { readFileSync, writeFileSync, readdirSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, mkdirSync, cpSync, existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const DOCS = join(ROOT, 'docs');
 mkdirSync(join(DOCS, 'assets'), { recursive: true });
+
+// docs/ must work on its own (GitHub Pages publishes only this folder):
+// diagrams are copied in, and links to labs/ or other repo files point at the GitHub repo.
+if (existsSync(join(ROOT, 'images'))) cpSync(join(ROOT, 'images'), join(DOCS, 'images'), { recursive: true });
+writeFileSync(join(DOCS, '.nojekyll'), '');        // serve files as-is, no Jekyll processing
+let repoUrl = '';                                  // e.g. https://github.com/<you>/argocd-notes
+try {
+  const remote = execFileSync('git', ['-C', ROOT, 'remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  const m = remote.match(/github\.com[:/]([^/]+)\/(.+?)(\.git)?$/);
+  if (m) repoUrl = `https://github.com/${m[1]}/${m[2]}`;
+} catch (e) { /* no git remote yet: links stay relative (fine locally) */ }
+console.log(repoUrl ? `repo links -> ${repoUrl}` : 'no GitHub remote yet: repo links stay relative (re-run after creating the repo)');
 
 // ---- pages: [source .md relative to repo root, output .html name, short nav label] ----
 const notes = readdirSync(join(ROOT, 'notes')).filter(f => f.endsWith('.md')).sort();
@@ -62,7 +75,7 @@ for (const [src, out, label] of pages) {
     <p class="hint">Generated from <code>${esc(src)}</code></p>
   </div>
 </aside>
-<main><article class="wrap" id="content" data-src-dir="${srcDir}"><p class="hint">Loading… (needs internet for the renderer scripts)</p></article></main>
+<main><article class="wrap" id="content" data-src-dir="${srcDir}" data-repo-url="${repoUrl}"><p class="hint">Loading… (needs internet for the renderer scripts)</p></article></main>
 <script type="text/markdown" id="md">${md.replace(/<\/script/gi, '<\\/script')}</script>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>

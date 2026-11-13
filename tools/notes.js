@@ -3,6 +3,7 @@
 (function () {
   var content = document.getElementById('content');
   var srcDir = content.getAttribute('data-src-dir') || '';
+  var repoUrl = content.getAttribute('data-repo-url') || '';
   var md = document.getElementById('md').textContent.replace(/<\\\/script/gi, '</script');
 
   if (typeof marked === 'undefined') {
@@ -48,8 +49,16 @@
     else if (repoPath === 'KEY-POINTS.md') target = 'key-points.html';
     else if (/^notes\/[^/]+\.md$/.test(repoPath)) target = repoPath.slice(6).replace(/\.md$/, '.html');
     else if (repoPath.indexOf('docs/') === 0) target = repoPath.slice(5);
-    else target = '../' + repoPath;                              // labs/, tools/ … live next to docs/
+    else if (repoUrl) target = repoUrl + (/\.[a-z0-9]+$/i.test(repoPath) ? '/blob/main/' : '/tree/main/') + repoPath;
+    else target = '../' + repoPath;                              // local fallback: labs/, tools/ … next to docs/
     a.setAttribute('href', target + hash);
+  });
+
+  // ---- diagrams live in docs/images/ (copied at build time) ----
+  content.querySelectorAll('img[src], source[srcset]').forEach(function (el) {
+    var attr = el.tagName === 'SOURCE' ? 'srcset' : 'src';
+    var v = el.getAttribute(attr);
+    if (v.indexOf('../images/') === 0) el.setAttribute(attr, v.slice(3));
   });
 
   // ---- code blocks: highlight + copy button ----

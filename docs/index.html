@@ -33,7 +33,7 @@
     <p class="hint">Generated from <code>README.md</code></p>
   </div>
 </aside>
-<main><article class="wrap" id="content" data-src-dir=""><p class="hint">Loading… (needs internet for the renderer scripts)</p></article></main>
+<main><article class="wrap" id="content" data-src-dir="" data-repo-url="https://github.com/uthrapathy-m/argocd-notes"><p class="hint">Loading… (needs internet for the renderer scripts)</p></article></main>
 <script type="text/markdown" id="md"># Argo CD Notes
 
 Personal study notes and hands-on labs for **Argo CD**, from GitOps basics to production habits. Every lecture has a Markdown note (the source of truth), a generated HTML page, and lab files you can copy and run on a local cluster.
@@ -129,7 +129,7 @@ Full setup: [notes/00-lab-setup.md](notes/00-lab-setup.md).
 
 ## HTML pages
 
-`docs/` holds a styled page per note (sidebar contents, hand-drawn diagrams, copy buttons, light/dark, print to A4). Open them directly in a browser, or publish them with **GitHub Pages** (Settings → Pages → Branch `main`, folder `/docs`).
+`docs/` holds a styled page per note (sidebar contents, hand-drawn diagrams, copy buttons, light/dark, print to A4). Open them directly in a browser, or publish them with **GitHub Pages** (Settings → Pages → Source *Deploy from a branch* → `main` + `/docs`). `docs/` is self-contained: the build copies the diagrams in and points lab links at this GitHub repo (taken from `git remote get-url origin`).
 
 After editing any Markdown, regenerate them (Node 18+, no npm install needed):
 ```bash
